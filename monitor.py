@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import signal
@@ -38,6 +39,8 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
+
+import accounts
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USER_AGENT = "claude-cli/2.1.198 (external, cli)"
@@ -93,9 +96,25 @@ FEED_KINDS = {"five_hour": "session", "seven_day": "weekly_all"}
 HISTORY_FILE = Path.home() / ".claude" / "usage-monitor-history.json"
 HISTORY_SAVE_EVERY = 60        # seconds between background saves
 
+# Saved accounts (claude-account): poll each non-live account's usage on its
+# own token — separate rate-limit budgets, so this never crowds the main poll
+ACCOUNTS_POLL = 300            # per-account usage cadence
+ACCOUNTS_TICK = 20             # how often the accounts thread wakes up
+ACCOUNTS_STAGGER = 10          # spread the first polls out at startup
+ACCOUNT_LABELS = {"session": "5h", "five_hour": "5h", "weekly_all": "wk", "seven_day": "wk"}
+
 
 def prettify_key(key: str) -> str:
     return key.replace("_", " ").strip().title()
+
+
+def to_float(value) -> float | None:
+    """Finite float or None — API/feed payloads are untrusted input."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 # ---------------------------------------------------------------- credentials
@@ -109,11 +128,15 @@ def read_access_token() -> tuple[str, str]:
     """Return (access_token, subscription_type) from the local Claude Code login."""
     raw = None
     if sys.platform == "darwin":
-        proc = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True,
+                text=True,
+                timeout=20,  # a Keychain GUI prompt must not wedge the poll thread
+            )
+        except subprocess.TimeoutExpired:
+            raise AuthError("keychain read timed out — is the Keychain locked?")
         if proc.returncode == 0:
             raw = proc.stdout.strip()
     if raw is None:
@@ -190,14 +213,19 @@ class Credits:
 
 
 def parse_dt(value) -> datetime | None:
-    if not value:
+    if value is None or value == "":
         return None
     try:
         if isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                return None
             return datetime.fromtimestamp(value, tz=timezone.utc)
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, OverflowError, OSError):
         return None
+    if parsed.tzinfo is None:  # naive timestamps would crash aware-datetime math later
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def limit_label(entry: dict) -> str:
@@ -216,12 +244,11 @@ def limit_label(entry: dict) -> str:
 def parse_limits(payload: dict) -> list[Limit]:
     limits: list[Limit] = []
     for entry in payload.get("limits") or []:
-        pct = entry.get("percent")
         limits.append(
             Limit(
                 kind=entry.get("kind", ""),
                 label=limit_label(entry),
-                percent=float(pct) if pct is not None else None,
+                percent=to_float(entry.get("percent")),
                 resets_at=parse_dt(entry.get("resets_at")),
                 severity=entry.get("severity") or "normal",
                 is_active=bool(entry.get("is_active")),
@@ -231,12 +258,11 @@ def parse_limits(payload: dict) -> list[Limit]:
         for key, label in (("five_hour", "Session · 5h window"), ("seven_day", "Week · all models")):
             val = payload.get(key)
             if isinstance(val, dict):
-                util = val.get("utilization")
                 limits.append(
                     Limit(
                         kind=key,
                         label=label,
-                        percent=float(util) if util is not None else None,
+                        percent=to_float(val.get("utilization")),
                         resets_at=parse_dt(val.get("resets_at")),
                     )
                 )
@@ -247,14 +273,23 @@ def parse_limits(payload: dict) -> list[Limit]:
 def parse_credits(payload: dict) -> Credits:
     extra = payload.get("extra_usage") or {}
     spend = payload.get("spend") or {}
-    enabled = bool(extra.get("is_enabled") or spend.get("enabled"))
-    used = extra.get("used_credits")
     return Credits(
-        enabled=enabled,
-        used=float(used) if used is not None else None,
-        limit=extra.get("monthly_limit"),
-        utilization=extra.get("utilization"),
+        enabled=bool(extra.get("is_enabled") or spend.get("enabled")),
+        used=to_float(extra.get("used_credits")),
+        limit=to_float(extra.get("monthly_limit")),
+        utilization=to_float(extra.get("utilization")),
     )
+
+
+@dataclass
+class AccountRow:
+    name: str
+    email: str
+    account_uuid: str
+    is_live: bool = False
+    limits: list[Limit] = field(default_factory=list)
+    fetched_at: float | None = None
+    note: str = ""
 
 
 @dataclass
@@ -266,6 +301,8 @@ class State:
     merged_prev: list[Limit] | None = None                 # for event detection
     credits: Credits = field(default_factory=Credits)
     history: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # kind -> [(epoch, pct)]
+    accounts: list[AccountRow] = field(default_factory=list)
+    accounts_warning: str = ""
     subscription: str = ""
     fetched_at: datetime | None = None
     status: str = "starting…"
@@ -310,11 +347,14 @@ def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
     for feed_key, kind in FEED_KINDS.items():
         cands = []
         for rl in entries:
-            w = rl.get(feed_key) or {}
-            pct, rst = w.get("used_percentage"), w.get("resets_at")
+            w = rl.get(feed_key)
+            if not isinstance(w, dict):
+                continue
+            pct = to_float(w.get("used_percentage"))
+            rst = to_float(w.get("resets_at"))
             if pct is None or rst is None:
                 continue
-            cands.append((float(rst), float(pct)))
+            cands.append((rst, pct))
         if not cands:
             continue
         latest_reset = max(r for r, _ in cands)
@@ -330,7 +370,10 @@ def merge_limits(api_limits: list[Limit], feed: dict[str, tuple[float, float]] |
     by_kind = {l.kind: l for l in limits}
     alias = {"session": "five_hour", "weekly_all": "seven_day"}
     for kind, (pct, reset_epoch) in feed.items():
-        resets_at = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+        try:
+            resets_at = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            continue
         lim = by_kind.get(kind) or by_kind.get(alias[kind])
         if lim is None:
             limits.append(Limit(kind=kind, label=KIND_LABELS[kind], percent=pct, resets_at=resets_at))
@@ -357,6 +400,8 @@ def recompute(state: State) -> list[str]:
             if lim.percent is None:
                 continue
             hist = state.history.setdefault(lim.kind, [])
+            if hist and now_ts <= hist[-1][0]:
+                continue  # wall clock jumped backwards; keep history ordered
             if hist and now_ts - hist[-1][0] < 30 and hist[-1][1] == lim.percent:
                 continue  # nothing new; heartbeat at most every 30s
             hist.append((now_ts, lim.percent))
@@ -462,16 +507,76 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
 def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None:
     last_save = time.time()
     while not stop.is_set():
-        result = read_feed()
-        with state.lock:
-            state.feed, state.feed_as_of = result if result else (None, None)
-        for msg in recompute(state):
-            if notify:
-                send_notification(msg)
-        if time.time() - last_save >= HISTORY_SAVE_EVERY:
-            save_history(state)
-            last_save = time.time()
+        try:
+            result = read_feed()
+            with state.lock:
+                state.feed, state.feed_as_of = result if result else (None, None)
+            for msg in recompute(state):
+                if notify:
+                    send_notification(msg)
+            if time.time() - last_save >= HISTORY_SAVE_EVERY:
+                save_history(state)
+                last_save = time.time()
+        except Exception:
+            pass  # a malformed feed file must never kill this thread
         stop.wait(FEED_POLL)
+
+
+def accounts_loop(state: State, stop: threading.Event) -> None:
+    """Track saved accounts (claude-account) and poll the non-live ones.
+
+    The live account's numbers come from the main panel's data; every other
+    slot gets its own relaxed usage poll, refreshing (and persisting) its
+    token via the accounts store when stale.
+    """
+    next_poll: dict[str, float] = {}
+    while not stop.is_set():
+        try:  # a bad index file or store hiccup must never kill this thread
+            index = accounts.load_index()
+            live_uuid = accounts.active_account_uuid()
+            with state.lock:
+                prev = {r.name: r for r in state.accounts}
+            rows: list[AccountRow] = []
+            for i, acct in enumerate(index):
+                old = prev.get(acct.name)
+                row = replace(old) if old else AccountRow(acct.name, acct.email, acct.account_uuid)
+                row.email, row.account_uuid = acct.email, acct.account_uuid
+                row.is_live = bool(live_uuid) and acct.account_uuid == live_uuid
+                rows.append(row)
+                if row.is_live:
+                    row.note = ""
+                    continue
+                now_ts = time.time()
+                due = next_poll.setdefault(acct.name, now_ts + i * ACCOUNTS_STAGGER)
+                if now_ts < due:
+                    continue
+                try:
+                    slot = accounts.ensure_fresh_slot(acct.name)
+                    payload = fetch_usage(slot["claudeAiOauth"]["accessToken"])
+                    row.limits = parse_limits(payload)
+                    row.fetched_at = time.time()
+                    row.note = ""
+                    next_poll[acct.name] = time.time() + ACCOUNTS_POLL + random.randint(0, 30)
+                except RateLimited as exc:
+                    row.note = "rate limited"
+                    next_poll[acct.name] = time.time() + (exc.retry_after or 120)
+                except (AuthError, accounts.AccountError):
+                    row.note = "needs /login"
+                    next_poll[acct.name] = time.time() + 600
+                except Exception:
+                    row.note = "error"
+                    next_poll[acct.name] = time.time() + 300
+            warning = (
+                "interrupted account switch — run any `claude-account` command to heal"
+                if accounts.read_marker() is not None
+                else ""
+            )
+            with state.lock:
+                state.accounts = rows
+                state.accounts_warning = warning
+        except Exception:
+            pass
+        stop.wait(ACCOUNTS_TICK)
 
 
 # ---------------------------------------------------------------- persistence
@@ -499,9 +604,10 @@ def load_history(state: State) -> None:
     with state.lock:
         for kind, samples in data.items():
             try:
-                clean = [(float(t), float(p)) for t, p in samples if float(t) >= cutoff]
+                pairs = [(to_float(t), to_float(p)) for t, p in samples]
             except (TypeError, ValueError):
                 continue
+            clean = [(t, p) for t, p in pairs if t is not None and p is not None and t >= cutoff]
             if clean:
                 state.history[kind] = clean
 
@@ -716,6 +822,52 @@ def render_limit(limit: Limit, now: datetime, width: int, rate: float | None = N
     return Group(*parts)
 
 
+def account_limit_label(limit: Limit) -> str:
+    short = ACCOUNT_LABELS.get(limit.kind)
+    if short:
+        return short
+    return limit.label.split("·")[-1].strip().lower()  # "Week · Fable" -> "fable"
+
+
+def render_accounts(rows: list[AccountRow], live_limits: list[Limit], width: int, now: datetime) -> Group | None:
+    """One line per saved account — spare capacity at a glance.
+
+    Hidden until there's a second account to compare against; the live row
+    reuses the main panel's merged limits instead of its own poll.
+    """
+    if not rows or all(r.is_live for r in rows):
+        return None
+    header = Text()
+    header.append("Accounts", style="bold")
+    header.append("  ·  usage per login", style=DIM)
+    lines: list[Text] = [header]
+    for row in rows:
+        limits = live_limits if row.is_live else row.limits
+        left = Text()
+        left.append("● " if row.is_live else "○ ", style=CLAUDE if row.is_live else DIM)
+        left.append(f"{row.name[:14]:<14}", style="bold" if row.is_live else "none")
+        shown = [l for l in limits if l.percent is not None]
+        for j, lim in enumerate(shown):
+            if j:
+                left.append("  ·  ", style=DIM)
+            left.append(f"{account_limit_label(lim)} ", style=DIM)
+            left.append(f"{lim.percent:.0f}%", style=pct_color(lim.percent))
+            if lim.kind in ("session", "five_hour") and lim.percent >= 90 and lim.resets_at:
+                left.append(f" ⟳{fmt_delta(lim.resets_at, now)}", style=DIM)
+        if not shown:
+            left.append(row.note or "waiting…", style=DIM)
+        right = Text()
+        if row.is_live:
+            right.append("live", style="green")
+        elif row.note:
+            right.append(row.note, style="yellow")
+        elif row.fetched_at is not None:
+            right.append(fmt_ago(datetime.fromtimestamp(row.fetched_at, tz=timezone.utc), now), style=DIM)
+        pad = max(2, width - left.cell_len - right.cell_len)
+        lines.append(Text.assemble(left, " " * pad, right))
+    return Group(*lines)
+
+
 def render(state: State, console: Console) -> Panel:
     now = datetime.now(timezone.utc)
     width = max(30, min(console.size.width - 10, 72))
@@ -724,6 +876,8 @@ def render(state: State, console: Console) -> Panel:
         limits = list(state.limits)
         credits = state.credits
         history = {k: list(v) for k, v in state.history.items()}
+        account_rows = list(state.accounts)
+        accounts_warning = state.accounts_warning
         subscription = state.subscription
         status = state.status
         status_style = state.status_style
@@ -768,6 +922,18 @@ def render(state: State, console: Console) -> Panel:
         if credits.limit:
             line.append(f" of ${credits.limit:.2f}/mo", style=DIM)
         body.append(line)
+        body.append(Text())
+
+    if accounts_warning:
+        warn = Text()
+        warn.append("⚠ ", style="yellow")
+        warn.append(accounts_warning, style="yellow")
+        body.append(warn)
+        body.append(Text())
+
+    accounts_section = render_accounts(account_rows, limits, width, now)
+    if accounts_section is not None:
+        body.append(accounts_section)
         body.append(Text())
 
     foot = Text()
@@ -816,12 +982,19 @@ def render(state: State, console: Console) -> Panel:
 # ---------------------------------------------------------------------- main
 
 
+def env_interval() -> int:
+    try:
+        return int(os.environ.get("CLAUDE_MONITOR_INTERVAL", "60"))
+    except ValueError:
+        return 60
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live monitor for Claude Code usage limits")
     parser.add_argument(
         "--interval",
         type=int,
-        default=int(os.environ.get("CLAUDE_MONITOR_INTERVAL", "60")),
+        default=env_interval(),
         help="poll interval in seconds (default 60, min 30)",
     )
     parser.add_argument("--once", action="store_true", help="fetch once, print raw JSON, and exit")
@@ -871,6 +1044,7 @@ def main() -> None:
     )
     thread.start()
     threading.Thread(target=feed_loop, args=(state, stop, args.notify), daemon=True).start()
+    threading.Thread(target=accounts_loop, args=(state, stop), daemon=True).start()
 
     def bye(*_):
         stop.set()
@@ -883,7 +1057,11 @@ def main() -> None:
     try:
         with Live(console=console, refresh_per_second=2, screen=True) as live:
             while not stop.is_set():
-                live.update(Align.center(render(state, console), vertical="middle"))
+                try:
+                    frame = Align.center(render(state, console), vertical="middle")
+                except Exception as exc:  # one bad value must not kill the monitor
+                    frame = Align.center(Text(f"render error: {exc}", style="red"), vertical="middle")
+                live.update(frame)
                 stop.wait(0.5)
     finally:
         save_history(state)

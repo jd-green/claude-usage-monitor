@@ -443,3 +443,275 @@ def test_render_shows_limits_and_limiting_tag():
     assert "Session · 5h window" in text and "Week · Fable" in text
     assert "◂ limiting" in text
     assert "15.0%" in text and "27.0%" in text
+
+
+# ------------------------------------------------------------------ accounts
+
+
+def account_rows() -> list[m.AccountRow]:
+    spare_limits = [
+        m.Limit("session", "Session · 5h window", 12.0, dt(NOW + 3600)),
+        m.Limit("weekly_all", "Week · all models", 8.0, dt(NOW + 86400)),
+        m.Limit("weekly_scoped", "Week · Fable", 41.0, dt(NOW + 86400)),
+    ]
+    return [
+        m.AccountRow("james", "james@jdgreen.io", "uuid-a", is_live=True),
+        m.AccountRow("spare", "spare@x.io", "uuid-b", limits=spare_limits, fetched_at=NOW - 120),
+    ]
+
+
+def test_render_accounts_rows_live_and_polled():
+    rows = account_rows()
+    live = [m.Limit("session", "Session · 5h window", 47.0, dt(NOW + 3600))]
+    g = m.render_accounts(rows, live, 72, dt(NOW))
+    lines = [r.plain for r in g.renderables]
+    assert "Accounts" in lines[0]
+    assert "● james" in lines[1] and "5h 47%" in lines[1] and lines[1].rstrip().endswith("live")
+    assert "○ spare" in lines[2] and "5h 12%" in lines[2] and "wk 8%" in lines[2]
+    assert "fable 41%" in lines[2]  # scoped label shortened
+    assert lines[2].rstrip().endswith("2m ago")
+
+
+def test_render_accounts_hot_session_shows_reset_countdown():
+    rows = account_rows()
+    rows[1].limits[0] = m.Limit("session", "Session · 5h window", 94.0, dt(NOW + 45 * 60))
+    g = m.render_accounts(rows, [], 72, dt(NOW))
+    assert "⟳45m" in g.renderables[2].plain
+
+
+def test_render_accounts_hidden_without_second_account():
+    assert m.render_accounts([], [], 72, dt(NOW)) is None
+    only_live = [m.AccountRow("james", "j@x.io", "uuid-a", is_live=True)]
+    assert m.render_accounts(only_live, [], 72, dt(NOW)) is None
+
+
+def test_render_accounts_note_and_waiting_states():
+    rows = [
+        m.AccountRow("james", "j@x.io", "uuid-a", is_live=True),
+        m.AccountRow("spare", "s@x.io", "uuid-b", note="needs /login"),
+        m.AccountRow("third", "t@x.io", "uuid-c"),
+    ]
+    g = m.render_accounts(rows, [], 72, dt(NOW))
+    assert "needs /login" in g.renderables[2].plain
+    assert "waiting…" in g.renderables[3].plain
+
+
+def test_render_includes_accounts_section():
+    state = full_state()
+    state.accounts = account_rows()
+    c = make_console()
+    c.print(m.render(state, c))
+    text = c.export_text()
+    assert "Accounts" in text and "spare" in text
+
+
+def test_accounts_loop_polls_only_non_live(monkeypatch):
+    monkeypatch.setattr(m.accounts, "load_index", lambda: [
+        m.accounts.Account("james", "j@x.io", "uuid-a"),
+        m.accounts.Account("spare", "s@x.io", "uuid-b"),
+    ])
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-a")
+    fetched = []
+
+    def fake_ensure(name):
+        return {"claudeAiOauth": {"accessToken": f"tok-{name}"}}
+
+    def fake_fetch(token):
+        fetched.append(token)
+        return API_PAYLOAD
+
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot", fake_ensure)
+    monkeypatch.setattr(m, "fetch_usage", fake_fetch)
+
+    state = m.State()
+    stop = threading.Event()
+    ticks = {"n": 0}
+    orig_wait = stop.wait
+
+    def wait(t=None):
+        ticks["n"] += 1
+        if ticks["n"] >= 3:  # a few ticks so the staggered first poll comes due
+            stop.set()
+            return True
+        return orig_wait(0)
+
+    stop.wait = wait
+    monkeypatch.setattr(m, "ACCOUNTS_TICK", 0)
+    monkeypatch.setattr(m, "ACCOUNTS_STAGGER", 0)
+    m.accounts_loop(state, stop)
+
+    assert fetched == ["tok-spare"]  # live account never polled
+    rows = {r.name: r for r in state.accounts}
+    assert rows["james"].is_live and not rows["spare"].is_live
+    assert rows["spare"].limits and rows["spare"].fetched_at is not None
+
+
+def test_accounts_loop_marks_auth_failures(monkeypatch):
+    monkeypatch.setattr(m.accounts, "load_index",
+                        lambda: [m.accounts.Account("spare", "s@x.io", "uuid-b")])
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-a")
+
+    def dead(name):
+        raise m.accounts.AccountError("refresh token rejected")
+
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot", dead)
+    state = m.State()
+    stop = threading.Event()
+    orig_wait = stop.wait
+
+    def wait(t=None):
+        if state.accounts and (state.accounts[0].note or stop.is_set()):
+            stop.set()
+            return True
+        return orig_wait(0)
+
+    stop.wait = wait
+    monkeypatch.setattr(m, "ACCOUNTS_TICK", 0)
+    m.accounts_loop(state, stop)
+    assert state.accounts[0].note == "needs /login"
+
+
+# --------------------------------------------------- review-fix regressions
+
+
+def test_parse_dt_naive_string_assumed_utc():
+    parsed = m.parse_dt("2026-07-02T18:10:00")  # no offset: must not stay naive
+    assert parsed is not None and parsed.tzinfo is not None
+    assert parsed == dt(1783015800)
+    # aware math must not raise (this crashed render() before the fix)
+    m.fmt_delta(parsed, datetime.now(timezone.utc))
+
+
+def test_parse_dt_rejects_nonfinite_and_garbage_epoch():
+    assert m.parse_dt(float("nan")) is None
+    assert m.parse_dt(float("inf")) is None
+    assert m.parse_dt(0) == dt(0)  # epoch 0 is a legitimate timestamp, not "missing"
+
+
+def test_parse_credits_garbage_types_do_not_crash_render():
+    payload = {"extra_usage": {"is_enabled": True, "used_credits": "12.5", "monthly_limit": "fifty"}}
+    credits = m.parse_credits(payload)
+    assert credits.used == 12.5 and credits.limit is None
+    state = full_state()
+    state.credits = credits
+    c = make_console()
+    c.print(m.render(state, c))  # used shown, bogus limit skipped, no crash
+    assert "Extra usage credits" in c.export_text()
+
+
+def test_parse_limits_garbage_percent():
+    payload = {"limits": [{"kind": "session", "percent": "bogus", "resets_at": None}]}
+    assert m.parse_limits(payload)[0].percent is None
+
+
+def test_read_feed_wrong_typed_leaves(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FEED_DIR", tmp_path)
+    write_feed_file(tmp_path, "bad1", {"five_hour": {"used_percentage": "bogus", "resets_at": 2_000_000}})
+    write_feed_file(tmp_path, "bad2", {"five_hour": ["not", "a", "dict"]})
+    write_feed_file(tmp_path, "bad3", {"five_hour": {"used_percentage": float("nan"), "resets_at": 2_000_000}})
+    write_feed_file(tmp_path, "good", {"five_hour": {"used_percentage": 21, "resets_at": 2_000_000}})
+    result = m.read_feed()
+    assert result is not None
+    feed, _ = result
+    assert feed["session"] == (21.0, 2_000_000.0)  # bad leaves skipped, good survives
+
+
+def test_merge_limits_nonfinite_reset_epoch_skipped():
+    out = m.merge_limits([], {"session": (50.0, float("inf"))})
+    assert out == []  # unrepresentable timestamp ignored, no OverflowError
+
+
+def test_feed_loop_survives_read_feed_exception(monkeypatch):
+    def boom():
+        raise RuntimeError("corrupt feed")
+
+    monkeypatch.setattr(m, "read_feed", boom)
+    state = m.State()
+    stop = threading.Event()
+    calls = {"n": 0}
+    orig_wait = stop.wait
+
+    def wait(t=None):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            stop.set()
+            return True
+        return orig_wait(0)
+
+    stop.wait = wait
+    m.feed_loop(state, stop)  # must complete 3 iterations without raising
+    assert calls["n"] >= 3
+
+
+def test_recompute_clock_backwards_keeps_history_ordered(monkeypatch):
+    state = m.State()
+    state.history["session"] = [(NOW + 1000, 40.0)]  # clock has since jumped back
+    state.api_limits = [m.Limit("session", "Session · 5h window", 45.0, None)]
+    monkeypatch.setattr(m.time, "time", lambda: NOW)
+    m.recompute(state)
+    times = [t for t, _ in state.history["session"]]
+    assert times == sorted(times) and len(times) == 1  # no out-of-order append
+
+
+def test_load_history_nonfinite_filtered(tmp_path, monkeypatch):
+    path = tmp_path / "hist.json"
+    monkeypatch.setattr(m, "HISTORY_FILE", path)
+    path.write_text('{"session": [[NaN, 10.0], [%f, 20.0]]}' % time.time())
+    state = m.State()
+    m.load_history(state)
+    assert [p for _, p in state.history.get("session", [])] == [20.0]
+
+
+def test_env_interval_garbage(monkeypatch):
+    monkeypatch.setenv("CLAUDE_MONITOR_INTERVAL", "sixty")
+    assert m.env_interval() == 60
+    monkeypatch.setenv("CLAUDE_MONITOR_INTERVAL", "90")
+    assert m.env_interval() == 90
+
+
+def test_fetch_usage_error_dispatch(monkeypatch):
+    import email.message
+    import io
+    import urllib.error
+
+    def http_error(code, headers=None):
+        hdrs = email.message.Message()
+        for k, v in (headers or {}).items():
+            hdrs[k] = v
+        return urllib.error.HTTPError("https://x", code, "err", hdrs, io.BytesIO(b""))
+
+    def raise_401(req, timeout):
+        raise http_error(401)
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", raise_401)
+    with pytest.raises(m.AuthError):
+        m.fetch_usage("tok")
+
+    def raise_429(req, timeout):
+        raise http_error(429, {"retry-after": "30"})
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", raise_429)
+    with pytest.raises(m.RateLimited) as exc_info:
+        m.fetch_usage("tok")
+    assert exc_info.value.retry_after == 30
+
+    class FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def body_error(req, timeout):
+        return FakeResp(json.dumps({"error": {"type": "rate_limit_error"}}).encode())
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", body_error)
+    with pytest.raises(m.RateLimited):
+        m.fetch_usage("tok")
+
+    def auth_body(req, timeout):
+        return FakeResp(json.dumps({"error": {"type": "authentication_error", "message": "no"}}).encode())
+
+    monkeypatch.setattr(m.urllib.request, "urlopen", auth_body)
+    with pytest.raises(m.AuthError):
+        m.fetch_usage("tok")

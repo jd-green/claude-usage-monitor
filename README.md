@@ -3,7 +3,9 @@
 A live tmux-pane TUI for Claude Code usage limits — the 5-hour session window,
 the weekly window, model-scoped weekly limits, and when each one resets. Styled
 to match the Claude Code terminal theme so it looks at home next to your other
-panes.
+panes. Comes with `claude-account`, a subscription router that cycles Claude
+Code across multiple claude.ai logins and shows each account's remaining
+capacity at the bottom of the monitor.
 
 ![Claude Usage Monitor](docs/preview.svg)
 
@@ -44,6 +46,7 @@ git clone https://github.com/jd-green/claude-usage-monitor.git
 cd claude-usage-monitor
 ln -sf "$(pwd)/claude-usage" ~/.local/bin/claude-usage
 ln -sf "$(pwd)/statusline-toggle" ~/.local/bin/claude-statusline
+ln -sf "$(pwd)/claude-account" ~/.local/bin/claude-account
 ```
 
 For the statusline modes (optional), point the Claude Code statusline at the
@@ -110,6 +113,10 @@ uv run monitor.py
   elapsed time with no data (monitor wasn't running), blank space is the
   window's remainder. History persists across restarts
   (`~/.claude/usage-monitor-history.json`).
+- **Accounts** — one row per saved login (see *Multiple accounts*): `●` marks
+  the live one, each row shows that account's window percentages, and a
+  session at ≥90% shows its reset countdown. Appears once a second account
+  is saved.
 - Bar colors shift green → yellow → orange → red as utilization climbs (and
   follow the API's severity flag when it escalates).
 
@@ -125,6 +132,66 @@ only on state *transitions*, never repeatedly:
 
 Remove `--notify` from the `claude-usage` wrapper if you'd rather it stay
 quiet.
+
+## Multiple accounts
+
+If you run more than one claude.ai subscription, `claude-account` turns the
+single Claude Code login into a rotation:
+
+```sh
+claude-account save            # snapshot the current login (name = email local part)
+# now `claude` → /login with the second account, then:
+claude-account save
+claude-account next            # rotate to the next saved login
+claude-account switch spare    # or jump to one by name
+claude-account list            # ● active, ○ ready, token state
+claude-account remove spare    # delete a slot (the account itself is untouched)
+```
+
+How a switch works: Claude Code keeps its OAuth tokens in the Keychain item
+`Claude Code-credentials` (macOS) or `~/.claude/.credentials.json` (Linux),
+and the account identity (`oauthAccount`, `userID`) in `~/.claude.json`.
+`switch` swaps both to the target slot's copies — and only those: MCP server
+logins stored in the same keychain blob and the rest of `~/.claude.json` are
+preserved. Before swapping, the live login's tokens are folded back into its
+own slot, so refresh-token rotation done by Claude Code is never lost. If a
+slot's access token has expired, it's refreshed against the same OAuth
+endpoint the CLI uses (and the rotated tokens are persisted).
+
+Two things to know:
+
+- **Running sessions keep their old login** (tokens are in memory) — a switch
+  applies to `claude` sessions started afterwards. The switch clears the
+  passive usage feed so leftover statusline snapshots from old-login sessions
+  don't bleed into the monitor; restart those sessions when convenient.
+- **Slot storage is Keychain-native on macOS** (service
+  `claude-usage-monitor.account`, one item per slot). On Linux, slots are
+  `0600` files under `~/.claude/usage-monitor-accounts/`. The index file
+  (`~/.claude/usage-monitor-accounts.json`) holds names and emails only —
+  tokens are never printed, logged, or written outside the keychain/slot
+  files. One deliberate exception: refresh tokens are single-use, so if a
+  keychain write fails right after a token refresh, the new tokens are kept
+  in a `0600` rescue file next to the slots (and folded back into the
+  keychain on the next successful write) rather than lost.
+
+### Accounts in the monitor
+
+With two or more slots saved, the monitor grows an **Accounts** section at
+the bottom — spare capacity at a glance, so you know whether another
+subscription has headroom before you hit a wall:
+
+```
+Accounts  ·  usage per login
+● james    5h 47% · wk 32% · fable 27%                        live
+○ spare    5h 91% ⟳42m 10s · wk 12%                           3m ago
+```
+
+The `●` live row mirrors the main panel's merged numbers. Every other slot is
+polled on its own token every 5 minutes (each account has its own rate-limit
+budget on the usage endpoint, so this doesn't compete with the main poll),
+with stale tokens auto-refreshed. A session window at ≥90% shows its reset
+countdown inline. Rows fall back to `rate limited` / `needs /login` /
+`waiting…` when data isn't available.
 
 ## Statusline modes
 
@@ -146,6 +213,11 @@ session switches together (within ~10s, one statusline refresh):
 
 In every mode, the dispatcher also writes the passive usage feed the monitor
 reads (see *How it works*).
+
+Note: neither full nor lite mode sandboxes ccstatusline — it runs unpinned
+(`npx -y ccstatusline@latest`) with access to your real `~/.claude` and
+`~/.cache` (lite's shadow `HOME` exists to swap the config, not to isolate).
+If that bothers you, `native` mode has no third-party dependency at all.
 
 ```sh
 claude-statusline lite     # ccstatusline without usage polling
@@ -183,8 +255,10 @@ sh tests/test_dispatch.sh
 ```
 
 The pytest suite covers the parsing, merge, pace, event, sparkline, and
-persistence logic plus footer rendering states — no network or Keychain
-access. The shell suite runs `statusline-dispatch` in an isolated `HOME`
+persistence logic plus footer rendering states, and the account router's
+slot store, switching, rotation, and token-refresh flows — no network or
+Keychain access (the accounts tests run against the file backend in a tmp
+dir with stubbed HTTP). The shell suite runs `statusline-dispatch` in an isolated `HOME`
 with a stubbed `npx`, asserting mode selection, feed writing, and the
 run-ccstatusline-exactly-once invariant. Both run in CI on every push.
 
@@ -193,7 +267,9 @@ run-ccstatusline-exactly-once invariant. Both run in CI on every push.
 | File | Purpose |
 | --- | --- |
 | `monitor.py` | The TUI itself (single-file, PEP 723 inline deps) |
+| `accounts.py` | Account router — slot store, login switching, token refresh (stdlib only) |
 | `claude-usage` | Launcher wrapper — `uv run monitor.py --lite-statusline` from anywhere |
+| `claude-account` | CLI wrapper for `accounts.py` — save/list/switch/next/remove/status |
 | `statusline-dispatch` | Statusline entrypoint for `~/.claude/settings.json`; picks full/lite/off |
 | `statusline-toggle` | Flips the mode flag files (installed as `claude-statusline`) |
 

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Cycle Claude Code across multiple claude.ai logins.
+#   claude-account save [name]   snapshot the current login as a slot
+#   claude-account next          rotate to the next saved account
+#   claude-account switch NAME   jump to a specific one
+#   claude-account list|status|remove NAME
+#
+# Install:  ln -sf "$(pwd)/claude-account" ~/.local/bin/claude-account
+SELF="$0"
+[ -L "$SELF" ] && SELF="$(readlink "$SELF")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+exec python3 "$DIR/accounts.py" "$@"
