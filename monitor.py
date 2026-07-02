@@ -250,6 +250,7 @@ class State:
     fetched_at: datetime | None = None
     status: str = "starting…"
     status_style: str = DIM
+    retry_at: float | None = None  # epoch of the next poll attempt while backing off
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -307,6 +308,7 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
                 state.fetched_at = datetime.now(timezone.utc)
                 state.status = "live"
                 state.status_style = "green"
+                state.retry_at = None
                 for lim in limits:
                     if lim.percent is None:
                         continue
@@ -332,19 +334,22 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
             delay += random.randint(0, 5)  # avoid syncing with statusline pollers
             with state.lock:
                 cached = " · showing cached data" if have_data else ""
-                state.status = f"rate limited, retrying in {delay}s{cached}"
+                state.status = f"rate limited{cached}"
                 state.status_style = "yellow"
+                state.retry_at = time.time() + delay
         except AuthError as exc:
             delay = max(interval, 60)
             with state.lock:
                 state.status = str(exc)
                 state.status_style = "red"
+                state.retry_at = time.time() + delay
         except Exception as exc:  # network blips etc.
             backoff = min(backoff * 2, 300) if backoff else 15
             delay = backoff
             with state.lock:
                 state.status = f"error: {exc}"
                 state.status_style = "red"
+                state.retry_at = time.time() + delay
         stop.wait(delay)
 
 
@@ -552,6 +557,7 @@ def render(state: State, console: Console) -> Panel:
         subscription = state.subscription
         status = state.status
         status_style = state.status_style
+        retry_at = state.retry_at
         fetched = state.fetched_at
     now_ts = now.timestamp()
 
@@ -595,6 +601,13 @@ def render(state: State, console: Console) -> Panel:
     foot = Text()
     dot = {"green": "●", "yellow": "◐", "red": "✗"}.get(status_style, "●")
     foot.append(f"{dot} {status}", style=status_style)
+    if retry_at is not None and status_style != "green":
+        if retry_at > now_ts:
+            countdown = fmt_delta(datetime.fromtimestamp(retry_at, tz=timezone.utc), now)
+            foot.append("  ·  retrying in ", style=DIM)
+            foot.append(countdown, style="bold")
+        else:
+            foot.append("  ·  retrying…", style=DIM)
     if fetched:
         foot.append(f"  ·  updated {fmt_ago(fetched, now)}", style=DIM)
     body.append(Align.center(foot))

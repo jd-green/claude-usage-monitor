@@ -145,7 +145,7 @@ The usage endpoint is aggressively rate-limited, and in full statusline mode
 every running Claude Code session polls it too. The monitor backs off
 automatically on 429 (honoring `Retry-After` when present, otherwise
 30s → 300s exponential) and keeps showing the last good data, marked as
-cached, until it can refresh. Running the statusline in lite mode removes the
+cached, with a live countdown to the next retry. Running the statusline in lite mode removes the
 per-session polling entirely, which makes the monitor's own refreshes far more
 reliable.
 
