@@ -1,0 +1,35 @@
+#!/bin/sh
+# Claude Code statusline dispatcher — full / lite / off, switched by flag files.
+#
+#   (no flag)                  full ccstatusline, unchanged
+#   ~/.claude/statusline.lite  ccstatusline minus the usage-limit widgets
+#                              (reset-timer, weekly-usage, weekly-reset-timer)
+#                              -> keeps model/context/tokens/cost, makes NO
+#                              network calls to the rate-limited usage endpoint
+#   ~/.claude/statusline.off   nothing
+#
+# Lite mode works by running ccstatusline with HOME pointed at a shadow home
+# whose config is generated from the real one (so theme/layout edits carry
+# over automatically); everything else in the shadow home symlinks back.
+
+[ -f "$HOME/.claude/statusline.off" ] && exit 0
+
+if [ -f "$HOME/.claude/statusline.lite" ]; then
+  LITE_HOME="$HOME/.claude/ccstatusline-lite"
+  REAL_CFG="$HOME/.config/ccstatusline/settings.json"
+  LITE_CFG="$LITE_HOME/.config/ccstatusline/settings.json"
+  if [ -f "$REAL_CFG" ] && command -v jq > /dev/null; then
+    if [ ! -f "$LITE_CFG" ] || [ "$REAL_CFG" -nt "$LITE_CFG" ]; then
+      mkdir -p "$LITE_HOME/.config/ccstatusline"
+      for d in .claude .cache .local .npm .npmrc Library; do
+        [ -e "$HOME/$d" ] && ln -sfn "$HOME/$d" "$LITE_HOME/$d"
+      done
+      jq '.lines |= (map(map(select(.type as $t | (["reset-timer","weekly-usage","weekly-reset-timer"] | index($t)) == null))) | map(select(length > 0)))' \
+        "$REAL_CFG" > "$LITE_CFG"
+    fi
+    HOME="$LITE_HOME" exec npx -y ccstatusline@latest
+  fi
+  # no real config or no jq — fall through to full rather than break the statusline
+fi
+
+exec npx -y ccstatusline@latest

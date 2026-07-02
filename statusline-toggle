@@ -1,0 +1,26 @@
+#!/bin/sh
+# Switch the Claude Code statusline mode in every session (takes effect within
+# ~10s on the next statusline refresh). Modes are flag files read by
+# statusline-dispatch, which ~/.claude/settings.json runs as the statusline.
+#
+#   full  — everything, including usage-limit widgets that poll the API
+#   lite  — model/context/tokens/cost only; no network calls
+#   off   — no statusline
+OFF="$HOME/.claude/statusline.off"
+LITE="$HOME/.claude/statusline.lite"
+
+mode() {
+  if [ -f "$OFF" ]; then echo "off"
+  elif [ -f "$LITE" ]; then echo "lite"
+  else echo "full"
+  fi
+}
+
+case "${1:-status}" in
+  full|on) rm -f "$OFF" "$LITE" ;;
+  lite)    rm -f "$OFF"; touch "$LITE" ;;
+  off)     rm -f "$LITE"; touch "$OFF" ;;
+  status)  ;;
+  *)       echo "usage: statusline-toggle [full|lite|off|status]" >&2; exit 1 ;;
+esac
+echo "statusline: $(mode)"

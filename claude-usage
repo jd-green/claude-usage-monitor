@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch the Claude usage monitor with the lite statusline (context info stays,
+# per-session usage polling stops). Any monitor.py flags pass through — e.g.
+# `claude-usage --mute-statusline` hides the statusline entirely instead.
+#
+# Install:  ln -sf "$(pwd)/claude-usage" ~/.local/bin/claude-usage
+SELF="$0"
+[ -L "$SELF" ] && SELF="$(readlink "$SELF")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+exec uv run "$DIR/monitor.py" --lite-statusline "$@"
