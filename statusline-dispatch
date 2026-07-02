@@ -22,6 +22,9 @@ PAYLOAD=$(cat)
 # ---- passive usage feed (best-effort; never break the statusline) ----------
 if command -v jq > /dev/null 2>&1; then
   SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)
+  case "$SID" in
+    *[!A-Za-z0-9_-]*) SID="" ;;  # session ids are UUID-shaped; anything else could traverse paths
+  esac
   if [ -n "$SID" ]; then
     FEED_DIR="$HOME/.claude/usage-feed"
     mkdir -p "$FEED_DIR" 2>/dev/null
@@ -82,8 +85,12 @@ if [ -f "$HOME/.claude/statusline.lite" ]; then
       for d in .claude .cache .local .npm .npmrc Library; do
         [ -e "$HOME/$d" ] && ln -sfn "$HOME/$d" "$LITE_HOME/$d"
       done
-      jq '.lines |= (map(map(select(.type as $t | (["reset-timer","weekly-usage","weekly-reset-timer"] | index($t)) == null))) | map(select(length > 0)))' \
-        "$REAL_CFG" > "$LITE_CFG"
+      TMPC="$LITE_CFG.tmp.$$"
+      if jq '.lines |= (map(map(select(.type as $t | (["reset-timer","weekly-usage","weekly-reset-timer"] | index($t)) == null))) | map(select(length > 0)))' \
+          "$REAL_CFG" > "$TMPC" 2>/dev/null; then
+        mv -f "$TMPC" "$LITE_CFG"
+      fi
+      rm -f "$TMPC" 2>/dev/null
     fi
     printf '%s' "$PAYLOAD" | HOME="$LITE_HOME" npx -y ccstatusline@latest
     exit

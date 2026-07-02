@@ -67,6 +67,13 @@ OUT=$(printf '%s' "$MINIMAL" | "$DIR/statusline-dispatch")
 [ "$(printf '%s\n' "$OUT" | grep -c 'CCSTATUSLINE RAN')" = "1" ] || fail "minimal payload: statusline must still render"
 jq -e '.rate_limits == null' "$TMP/.claude/usage-feed/bare.json" > /dev/null || fail "minimal payload: feed should record null rate_limits"
 
+# --- malicious session_id must not traverse paths ----------------------------
+EVIL='{"session_id":"../../evil","rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1900000000}}}'
+printf '%s' "$EVIL" | "$DIR/statusline-dispatch" > /dev/null
+[ ! -e "$TMP/.claude/evil.json" ] && [ ! -e "$TMP/evil.json" ] && [ ! -e "$TMP/.claude/usage-feed/../../evil.json" ] \
+  || fail "path traversal: evil.json written outside feed dir"
+find "$TMP" -name "*evil*" 2>/dev/null | grep -q . && fail "path traversal: evil file created somewhere" || true
+
 # --- statusline-toggle mode transitions --------------------------------------
 [ "$("$DIR/statusline-toggle" status)" = "statusline: full" ] || fail "toggle: expected full"
 "$DIR/statusline-toggle" lite > /dev/null
