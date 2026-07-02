@@ -9,14 +9,25 @@ panes.
 
 ## How it works
 
-The monitor reads the OAuth token for the claude.ai login that Claude Code is
-currently authenticated with (macOS Keychain item `Claude Code-credentials`,
-or `~/.claude/.credentials.json` on Linux) and polls the same endpoint the
-`/usage` screen in Claude Code uses (`api.anthropic.com/api/oauth/usage`).
-Data comes straight from Anthropic — no estimating from local logs.
+Two data sources, merged:
+
+1. **Passive feed (primary).** Claude Code pipes a `rate_limits` object to
+   every statusline refresh (~10s) in every session. `statusline-dispatch`
+   snapshots it to `~/.claude/usage-feed/<session>.json`, and the monitor
+   reads those files — so while any session is running, session/weekly
+   numbers are seconds-fresh with **zero API calls**. Sessions can report
+   slightly stale numbers, so the merge takes the newest reset instance and
+   the max percent within it (usage is monotonic inside a window).
+2. **API poll (supplement).** The monitor also polls the endpoint the
+   `/usage` screen uses (`api.anthropic.com/api/oauth/usage`) with the OAuth
+   token of the current Claude Code login (macOS Keychain item
+   `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux) —
+   for what the feed lacks: model-scoped weekly limits, the `◂ limiting`
+   flag, severity, and usage credits. While the feed is fresh this poll
+   relaxes to every 5 minutes, so it rarely gets rate-limited at all.
 
 The token is only ever held in memory; it is never printed, logged, or written
-anywhere.
+anywhere. The feed files contain only percentages and reset times.
 
 ## Requirements
 
@@ -123,10 +134,17 @@ session switches together (within ~10s, one statusline refresh):
   running ccstatusline with `HOME` pointed at a shadow home
   (`~/.claude/ccstatusline-lite/`) whose config is auto-generated from the
   real one, so theme/layout edits carry over.
+- **native** — a minimal one-liner (model, context used/size/%, session cost)
+  rendered directly from the JSON Claude Code pipes in — no npx startup, no
+  transcript parsing, zero network.
 - **off** — nothing.
 
+In every mode, the dispatcher also writes the passive usage feed the monitor
+reads (see *How it works*).
+
 ```sh
-claude-statusline lite     # context info only, no usage polling
+claude-statusline lite     # ccstatusline without usage polling
+claude-statusline native   # minimal, zero-dependency line
 claude-statusline full     # everything back
 claude-statusline off      # blank
 claude-statusline status   # check
@@ -142,10 +160,13 @@ already set it manually. If the monitor dies to SIGKILL a flag can linger —
 ## Rate limiting
 
 The usage endpoint is aggressively rate-limited, and in full statusline mode
-every running Claude Code session polls it too. The monitor backs off
-automatically on 429 (honoring `Retry-After` when present, otherwise
-30s → 300s exponential) and keeps showing the last good data, marked as
-cached, with a live countdown to the next retry. Running the statusline in lite mode removes the
+every running Claude Code session polls it too. The passive feed makes this
+mostly moot: session and weekly numbers keep streaming regardless, the footer
+shows both source ages (`● live · feed 6s ago · api 3m ago`), and the API
+poll relaxes to every 5 minutes while the feed is fresh. When the API does
+429, the monitor backs off (honoring `Retry-After` when present, otherwise
+30s → 300s exponential) with a live countdown, and only the scoped-limit /
+`◂ limiting` details go briefly stale. Running the statusline in lite mode removes the
 per-session polling entirely, which makes the monitor's own refreshes far more
 reliable.
 

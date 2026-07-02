@@ -4,10 +4,13 @@
 # ///
 """Claude Usage Monitor — a live TUI for Claude Code usage limits.
 
-Reads the OAuth token for the currently authenticated claude.ai login
-(macOS Keychain item "Claude Code-credentials", or ~/.claude/.credentials.json
-on Linux) and polls the same usage endpoint Claude Code's /usage screen uses.
-The token is never printed, logged, or written anywhere.
+Primary data source is the passive feed statusline-dispatch writes to
+~/.claude/usage-feed/ from the rate_limits JSON Claude Code pipes to every
+statusline refresh — seconds-fresh, zero API calls. The rate-limited usage
+API (the same endpoint Claude Code's /usage screen uses, authenticated via
+the local login's OAuth token) is polled only as a supplement for scoped
+limits, the limiting flag, severity, and credits. The token is never
+printed, logged, or written anywhere.
 
 Run it in a tmux pane:  uv run monitor.py
 """
@@ -25,7 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -76,6 +79,15 @@ PACE_LOOKBACK = 45 * 60        # burn rate measured over the last 45 min
 PACE_MIN_SPAN = 5 * 60         # ... but only once samples span 5+ min
 NOTIFY_THRESHOLDS = (95, 80)   # notify on upward crossings, highest first
 RESET_DROP = 20                # a drop this large (in points) counts as a window reset
+
+# Passive feed: statusline-dispatch snapshots the rate_limits that Claude Code
+# pipes to every statusline refresh, one file per session. While any session
+# is running, the monitor reads these instead of hammering the API.
+FEED_DIR = Path.home() / ".claude" / "usage-feed"
+FEED_MAX_AGE = 60              # ignore session files older than this
+FEED_POLL = 5                  # how often the feed thread re-reads the dir
+API_RELAXED_INTERVAL = 300     # API poll cadence while the feed is fresh
+FEED_KINDS = {"five_hour": "session", "seven_day": "weekly_all"}
 
 
 def prettify_key(key: str) -> str:
@@ -243,7 +255,11 @@ def parse_credits(payload: dict) -> Credits:
 
 @dataclass
 class State:
-    limits: list[Limit] = field(default_factory=list)
+    limits: list[Limit] = field(default_factory=list)      # merged view (rendered)
+    api_limits: list[Limit] = field(default_factory=list)  # last full API payload
+    feed: dict[str, tuple[float, float]] | None = None     # kind -> (pct, resets_epoch)
+    feed_as_of: float | None = None
+    merged_prev: list[Limit] | None = None                 # for event detection
     credits: Credits = field(default_factory=Credits)
     history: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # kind -> [(epoch, pct)]
     subscription: str = ""
@@ -252,6 +268,98 @@ class State:
     status_style: str = DIM
     retry_at: float | None = None  # epoch of the next poll attempt while backing off
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+# ------------------------------------------------------------------ feed/merge
+
+
+def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
+    """Merge fresh per-session feed files into per-window (pct, resets_epoch).
+
+    Sessions can pipe stale numbers (they report what they last learned), so:
+    take the newest resets_at as the current window instance, then the max
+    percent among sessions reporting that instance — usage is monotonic
+    within a window, so max = freshest.
+    """
+    try:
+        files = list(FEED_DIR.glob("*.json"))
+    except OSError:
+        return None
+    now_ts = time.time()
+    entries: list[dict] = []
+    as_of = 0.0
+    for f in files:
+        try:
+            mtime = f.stat().st_mtime
+            if now_ts - mtime > FEED_MAX_AGE:
+                continue
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        rl = data.get("rate_limits")
+        if isinstance(rl, dict):
+            entries.append(rl)
+            as_of = max(as_of, mtime)
+    if not entries:
+        return None
+    merged: dict[str, tuple[float, float]] = {}
+    for feed_key, kind in FEED_KINDS.items():
+        cands = []
+        for rl in entries:
+            w = rl.get(feed_key) or {}
+            pct, rst = w.get("used_percentage"), w.get("resets_at")
+            if pct is None or rst is None:
+                continue
+            cands.append((float(rst), float(pct)))
+        if not cands:
+            continue
+        latest_reset = max(r for r, _ in cands)
+        merged[kind] = (max(p for r, p in cands if r == latest_reset), latest_reset)
+    return (merged, as_of) if merged else None
+
+
+def merge_limits(api_limits: list[Limit], feed: dict[str, tuple[float, float]] | None) -> list[Limit]:
+    """Overlay the passive feed onto the last API snapshot, monotonic per window."""
+    limits = [replace(l) for l in api_limits]
+    if not feed:
+        return limits
+    by_kind = {l.kind: l for l in limits}
+    alias = {"session": "five_hour", "weekly_all": "seven_day"}
+    for kind, (pct, reset_epoch) in feed.items():
+        resets_at = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+        lim = by_kind.get(kind) or by_kind.get(alias[kind])
+        if lim is None:
+            limits.append(Limit(kind=kind, label=KIND_LABELS[kind], percent=pct, resets_at=resets_at))
+            continue
+        api_reset = lim.resets_at.timestamp() if lim.resets_at else 0.0
+        if reset_epoch > api_reset + 120:      # feed sees a newer window instance
+            lim.percent, lim.resets_at = pct, resets_at
+        elif reset_epoch > api_reset - 120:    # same window: usage only climbs
+            lim.percent = pct if lim.percent is None else max(lim.percent, pct)
+        # else: feed entry is for an already-ended window; keep API data
+    limits.sort(key=lambda l: KIND_ORDER.get(l.kind, 99))
+    return limits
+
+
+def recompute(state: State) -> list[str]:
+    """Rebuild the merged view + history; return notification-worthy events."""
+    now_ts = time.time()
+    with state.lock:
+        merged = merge_limits(state.api_limits, state.feed)
+        events = detect_events(state.merged_prev, merged) if state.merged_prev is not None else []
+        state.merged_prev = merged
+        state.limits = merged
+        for lim in merged:
+            if lim.percent is None:
+                continue
+            hist = state.history.setdefault(lim.kind, [])
+            if hist and now_ts - hist[-1][0] < 30 and hist[-1][1] == lim.percent:
+                continue  # nothing new; heartbeat at most every 30s
+            hist.append((now_ts, lim.percent))
+            cutoff = now_ts - HISTORY_SPAN
+            while hist and hist[0][0] < cutoff:
+                hist.pop(0)
+    return events
 
 
 # ------------------------------------------------------------- notifications
@@ -292,36 +400,30 @@ def send_notification(msg: str) -> None:
 
 def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool = False) -> None:
     backoff = 0
-    prev_limits: list[Limit] | None = None
     while not stop.is_set():
         delay = interval
         try:
             token, sub = read_access_token()
             payload = fetch_usage(token)
-            limits = parse_limits(payload)
+            api_limits = parse_limits(payload)
             credits = parse_credits(payload)
-            now_ts = time.time()
             with state.lock:
-                state.limits = limits
+                state.api_limits = api_limits
                 state.credits = credits
                 state.subscription = sub
                 state.fetched_at = datetime.now(timezone.utc)
                 state.status = "live"
                 state.status_style = "green"
                 state.retry_at = None
-                for lim in limits:
-                    if lim.percent is None:
-                        continue
-                    hist = state.history.setdefault(lim.kind, [])
-                    hist.append((now_ts, lim.percent))
-                    cutoff = now_ts - HISTORY_SPAN
-                    while hist and hist[0][0] < cutoff:
-                        hist.pop(0)
-            if notify and prev_limits is not None:
-                for msg in detect_events(prev_limits, limits):
+                feed_fresh = state.feed_as_of is not None and time.time() - state.feed_as_of < FEED_MAX_AGE
+            for msg in recompute(state):
+                if notify:
                     send_notification(msg)
-            prev_limits = limits
             backoff = 0
+            if feed_fresh:
+                # the feed keeps session/weekly fresh; the API is only needed
+                # for scoped limits, is_active, severity, and credits
+                delay = max(interval, API_RELAXED_INTERVAL)
         except RateLimited as exc:
             with state.lock:
                 have_data = bool(state.limits)
@@ -351,6 +453,17 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
                 state.status_style = "red"
                 state.retry_at = time.time() + delay
         stop.wait(delay)
+
+
+def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None:
+    while not stop.is_set():
+        result = read_feed()
+        with state.lock:
+            state.feed, state.feed_as_of = result if result else (None, None)
+        for msg in recompute(state):
+            if notify:
+                send_notification(msg)
+        stop.wait(FEED_POLL)
 
 
 # ------------------------------------------------------------------ rendering
@@ -559,6 +672,7 @@ def render(state: State, console: Console) -> Panel:
         status_style = state.status_style
         retry_at = state.retry_at
         fetched = state.fetched_at
+        feed_as_of = state.feed_as_of
     now_ts = now.timestamp()
 
     body: list = [Text()]
@@ -599,17 +713,35 @@ def render(state: State, console: Console) -> Panel:
         body.append(Text())
 
     foot = Text()
-    dot = {"green": "●", "yellow": "◐", "red": "✗"}.get(status_style, "●")
-    foot.append(f"{dot} {status}", style=status_style)
-    if retry_at is not None and status_style != "green":
-        if retry_at > now_ts:
-            countdown = fmt_delta(datetime.fromtimestamp(retry_at, tz=timezone.utc), now)
-            foot.append("  ·  retrying in ", style=DIM)
-            foot.append(countdown, style="bold")
+    feed_fresh = feed_as_of is not None and now_ts - feed_as_of < FEED_MAX_AGE
+    if feed_fresh:
+        # session/weekly numbers stream in passively; the API channel is auxiliary
+        foot.append("● live", style="green")
+        foot.append(f"  ·  feed {fmt_ago(datetime.fromtimestamp(feed_as_of, tz=timezone.utc), now)}", style=DIM)
+        if status_style == "green":
+            if fetched:
+                foot.append(f"  ·  api {fmt_ago(fetched, now)}", style=DIM)
         else:
-            foot.append("  ·  retrying…", style=DIM)
-    if fetched:
-        foot.append(f"  ·  updated {fmt_ago(fetched, now)}", style=DIM)
+            foot.append(f"  ·  api: {status}", style=DIM)
+            if retry_at is not None:
+                if retry_at > now_ts:
+                    countdown = fmt_delta(datetime.fromtimestamp(retry_at, tz=timezone.utc), now)
+                    foot.append(", retry in ", style=DIM)
+                    foot.append(countdown, style=DIM)
+                else:
+                    foot.append(", retrying…", style=DIM)
+    else:
+        dot = {"green": "●", "yellow": "◐", "red": "✗"}.get(status_style, "●")
+        foot.append(f"{dot} {status}", style=status_style)
+        if retry_at is not None and status_style != "green":
+            if retry_at > now_ts:
+                countdown = fmt_delta(datetime.fromtimestamp(retry_at, tz=timezone.utc), now)
+                foot.append("  ·  retrying in ", style=DIM)
+                foot.append(countdown, style="bold")
+            else:
+                foot.append("  ·  retrying…", style=DIM)
+        if fetched:
+            foot.append(f"  ·  updated {fmt_ago(fetched, now)}", style=DIM)
     body.append(Align.center(foot))
 
     return Panel(
@@ -679,6 +811,7 @@ def main() -> None:
         target=poll_loop, args=(state, max(args.interval, 30), stop, args.notify), daemon=True
     )
     thread.start()
+    threading.Thread(target=feed_loop, args=(state, stop, args.notify), daemon=True).start()
 
     def bye(*_):
         stop.set()

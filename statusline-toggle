@@ -3,24 +3,29 @@
 # ~10s on the next statusline refresh). Modes are flag files read by
 # statusline-dispatch, which ~/.claude/settings.json runs as the statusline.
 #
-#   full  — everything, including usage-limit widgets that poll the API
-#   lite  — model/context/tokens/cost only; no network calls
-#   off   — no statusline
+#   full   — everything, including usage-limit widgets that poll the API
+#   lite   — ccstatusline's model/context/tokens/cost only; no network calls
+#   native — minimal model/context/cost rendered from Claude Code's own
+#            statusline JSON; no npx, no transcript parsing, zero network
+#   off    — no statusline
 OFF="$HOME/.claude/statusline.off"
 LITE="$HOME/.claude/statusline.lite"
+NATIVE="$HOME/.claude/statusline.native"
 
 mode() {
   if [ -f "$OFF" ]; then echo "off"
+  elif [ -f "$NATIVE" ]; then echo "native"
   elif [ -f "$LITE" ]; then echo "lite"
   else echo "full"
   fi
 }
 
 case "${1:-status}" in
-  full|on) rm -f "$OFF" "$LITE" ;;
-  lite)    rm -f "$OFF"; touch "$LITE" ;;
-  off)     rm -f "$LITE"; touch "$OFF" ;;
+  full|on) rm -f "$OFF" "$LITE" "$NATIVE" ;;
+  lite)    rm -f "$OFF" "$NATIVE"; touch "$LITE" ;;
+  native)  rm -f "$OFF" "$LITE"; touch "$NATIVE" ;;
+  off)     rm -f "$LITE" "$NATIVE"; touch "$OFF" ;;
   status)  ;;
-  *)       echo "usage: statusline-toggle [full|lite|off|status]" >&2; exit 1 ;;
+  *)       echo "usage: statusline-toggle [full|lite|native|off|status]" >&2; exit 1 ;;
 esac
 echo "statusline: $(mode)"

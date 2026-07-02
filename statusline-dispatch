@@ -1,18 +1,76 @@
 #!/bin/sh
-# Claude Code statusline dispatcher — full / lite / off, switched by flag files.
+# Claude Code statusline dispatcher — full / lite / native / off, switched by
+# flag files. In EVERY mode it first snapshots the rate_limits object that
+# Claude Code pipes in on stdin to ~/.claude/usage-feed/<session>.json, so the
+# usage monitor can read limits passively instead of polling the rate-limited
+# API.
 #
-#   (no flag)                  full ccstatusline, unchanged
-#   ~/.claude/statusline.lite  ccstatusline minus the usage-limit widgets
-#                              (reset-timer, weekly-usage, weekly-reset-timer)
-#                              -> keeps model/context/tokens/cost, makes NO
-#                              network calls to the rate-limited usage endpoint
-#   ~/.claude/statusline.off   nothing
+#   (no flag)                   full ccstatusline, unchanged
+#   ~/.claude/statusline.lite   ccstatusline minus the usage-limit widgets
+#                               (reset-timer, weekly-usage, weekly-reset-timer)
+#   ~/.claude/statusline.native minimal renderer straight from the stdin JSON:
+#                               model, context window, cost — no npx, no
+#                               transcript parsing, zero network
+#   ~/.claude/statusline.off    nothing
 #
-# Lite mode works by running ccstatusline with HOME pointed at a shadow home
-# whose config is generated from the real one (so theme/layout edits carry
-# over automatically); everything else in the shadow home symlinks back.
+# Flag precedence: off > native > lite. Lite works by running ccstatusline
+# with HOME pointed at a shadow home whose config is generated from the real
+# one (so theme/layout edits carry over).
 
+PAYLOAD=$(cat)
+
+# ---- passive usage feed (best-effort; never break the statusline) ----------
+if command -v jq > /dev/null 2>&1; then
+  SID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)
+  if [ -n "$SID" ]; then
+    FEED_DIR="$HOME/.claude/usage-feed"
+    mkdir -p "$FEED_DIR" 2>/dev/null
+    TMP="$FEED_DIR/.$SID.$$.tmp"
+    if printf '%s' "$PAYLOAD" | jq -c \
+        '{captured_at: now, session_id: .session_id, rate_limits: .rate_limits}' \
+        > "$TMP" 2>/dev/null; then
+      mv -f "$TMP" "$FEED_DIR/$SID.json" 2>/dev/null
+    fi
+    rm -f "$TMP" 2>/dev/null
+    find "$FEED_DIR" -name '*.json' -mtime +1 -delete 2>/dev/null
+  fi
+fi
+
+# ---- mode dispatch ----------------------------------------------------------
 [ -f "$HOME/.claude/statusline.off" ] && exit 0
+
+if [ -f "$HOME/.claude/statusline.native" ] && command -v jq > /dev/null 2>&1; then
+  printf '%s' "$PAYLOAD" | jq -r '
+    def fmtk: if . == null then "?"
+      elif . >= 1000000 then "\(. / 100000 | round / 10)M"
+      elif . >= 1000 then "\(. / 1000 | round)k"
+      else tostring end;
+    [ (.model.display_name // "Claude"),
+      (.context_window.used_percentage // 0 | round),
+      ((.context_window.current_usage // {})
+        | (.input_tokens // 0) + (.cache_read_input_tokens // 0)
+          + (.cache_creation_input_tokens // 0) + (.output_tokens // 0) | fmtk),
+      (.context_window.context_window_size // 0 | fmtk),
+      ((.cost.total_cost_usd // 0) * 100 | round / 100)
+    ] | @tsv' 2>/dev/null | {
+    IFS="$(printf '\t')" read -r MODEL PCT USED SIZE COST
+    [ -z "$MODEL" ] && exit 0
+    if [ "$PCT" -ge 90 ] 2>/dev/null; then CTX=167      # red
+    elif [ "$PCT" -ge 75 ] 2>/dev/null; then CTX=208    # orange
+    elif [ "$PCT" -ge 50 ] 2>/dev/null; then CTX=214    # amber
+    else CTX=108; fi                                    # green
+    E=$(printf '\033')
+    R="${E}[0m"
+    FG="${E}[38;5;16m"
+    SEP=""
+    SEG1="${E}[48;5;167m${FG} Model: ${MODEL} ${R}${E}[38;5;167m${E}[48;5;${CTX}m${SEP}${R}"
+    SEG2="${E}[48;5;${CTX}m${FG} Ctx: ${USED}/${SIZE} (${PCT}%) ${R}${E}[38;5;${CTX}m${E}[48;5;246m${SEP}${R}"
+    COST=$(printf '%.2f' "$COST" 2>/dev/null || echo "$COST")
+    SEG3="${E}[48;5;246m${FG} \$${COST} ${R}${E}[38;5;246m${SEP}${R}"
+    printf '%s%s%s\n' "$SEG1" "$SEG2" "$SEG3"
+  }
+  exit 0
+fi
 
 if [ -f "$HOME/.claude/statusline.lite" ]; then
   LITE_HOME="$HOME/.claude/ccstatusline-lite"
@@ -27,9 +85,9 @@ if [ -f "$HOME/.claude/statusline.lite" ]; then
       jq '.lines |= (map(map(select(.type as $t | (["reset-timer","weekly-usage","weekly-reset-timer"] | index($t)) == null))) | map(select(length > 0)))' \
         "$REAL_CFG" > "$LITE_CFG"
     fi
-    HOME="$LITE_HOME" exec npx -y ccstatusline@latest
+    printf '%s' "$PAYLOAD" | HOME="$LITE_HOME" exec npx -y ccstatusline@latest
   fi
   # no real config or no jq — fall through to full rather than break the statusline
 fi
 
-exec npx -y ccstatusline@latest
+printf '%s' "$PAYLOAD" | exec npx -y ccstatusline@latest
