@@ -85,9 +85,10 @@ if [ -f "$HOME/.claude/statusline.lite" ]; then
       jq '.lines |= (map(map(select(.type as $t | (["reset-timer","weekly-usage","weekly-reset-timer"] | index($t)) == null))) | map(select(length > 0)))' \
         "$REAL_CFG" > "$LITE_CFG"
     fi
-    printf '%s' "$PAYLOAD" | HOME="$LITE_HOME" exec npx -y ccstatusline@latest
+    printf '%s' "$PAYLOAD" | HOME="$LITE_HOME" npx -y ccstatusline@latest
+    exit
   fi
   # no real config or no jq — fall through to full rather than break the statusline
 fi
 
-printf '%s' "$PAYLOAD" | exec npx -y ccstatusline@latest
+printf '%s' "$PAYLOAD" | npx -y ccstatusline@latest
