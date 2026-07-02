@@ -103,8 +103,11 @@ uv run monitor.py
   `~64% at reset` (you'll clear it) or `hits 100% ~3:40 pm, before reset`
   (you won't). Appears once a few minutes of samples accumulate; measurement
   restarts automatically after a window reset.
-- **Session history** — a sparkline of the 5h window over the last few hours
-  (up to 6h, in memory only), colored by utilization; resets show as drops.
+- **Session history** — a 3-row chart of the 5h window over the last few
+  hours (up to 6h), height on a fixed 0–100% scale, colored by utilization;
+  resets show as cliffs. History persists across restarts
+  (`~/.claude/usage-monitor-history.json`), so a fresh monitor keeps the
+  day's shape.
 - Bar colors shift green → yellow → orange → red as utilization climbs (and
   follow the API's severity flag when it escalates).
 

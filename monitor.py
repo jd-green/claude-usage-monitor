@@ -89,6 +89,10 @@ FEED_POLL = 5                  # how often the feed thread re-reads the dir
 API_RELAXED_INTERVAL = 300     # API poll cadence while the feed is fresh
 FEED_KINDS = {"five_hour": "session", "seven_day": "weekly_all"}
 
+# History persists across restarts so the sparkline keeps the day's shape
+HISTORY_FILE = Path.home() / ".claude" / "usage-monitor-history.json"
+HISTORY_SAVE_EVERY = 60        # seconds between background saves
+
 
 def prettify_key(key: str) -> str:
     return key.replace("_", " ").strip().title()
@@ -456,6 +460,7 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
 
 
 def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None:
+    last_save = time.time()
     while not stop.is_set():
         result = read_feed()
         with state.lock:
@@ -463,7 +468,42 @@ def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None
         for msg in recompute(state):
             if notify:
                 send_notification(msg)
+        if time.time() - last_save >= HISTORY_SAVE_EVERY:
+            save_history(state)
+            last_save = time.time()
         stop.wait(FEED_POLL)
+
+
+# ---------------------------------------------------------------- persistence
+
+
+def save_history(state: State) -> None:
+    try:
+        with state.lock:
+            data = {k: [[round(t, 1), p] for t, p in v] for k, v in state.history.items()}
+        tmp = HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(HISTORY_FILE)
+    except OSError:
+        pass
+
+
+def load_history(state: State) -> None:
+    try:
+        data = json.loads(HISTORY_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    cutoff = time.time() - HISTORY_SPAN
+    if not isinstance(data, dict):
+        return
+    with state.lock:
+        for kind, samples in data.items():
+            try:
+                clean = [(float(t), float(p)) for t, p in samples if float(t) >= cutoff]
+            except (TypeError, ValueError):
+                continue
+            if clean:
+                state.history[kind] = clean
 
 
 # ------------------------------------------------------------------ rendering
@@ -549,6 +589,9 @@ def fmt_span(secs: int) -> str:
     return f"{mins}m"
 
 
+SPARK_ROWS = 3  # chart height; each row covers a third of 0-100%
+
+
 def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: float) -> Group | None:
     if len(samples) < 2:
         return None
@@ -560,7 +603,7 @@ def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: flo
     bucket = max(span / width, median_gap, 30.0)
     n = min(width, int(span / bucket) + 1)
 
-    row = Text()
+    cells: list[float | None] = []
     for i in range(n):
         lo = now_ts - (n - i) * bucket
         hi = lo + bucket
@@ -568,16 +611,31 @@ def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: flo
         for t, p in samples:
             if lo <= t < hi:
                 val = p
-        if val is None:
-            row.append("·", style=BAR_EMPTY)
-        else:
-            row.append(SPARK_CHARS[min(7, int(val / 100 * 8))], style=pct_color(val))
+        cells.append(val)
+
+    band = 100.0 / SPARK_ROWS
+    rows = []
+    for level in range(SPARK_ROWS - 1, -1, -1):  # top band first
+        lo_bound = level * band
+        row = Text()
+        for val in cells:
+            if val is None:
+                row.append("·" if level == 0 else " ", style=BAR_EMPTY)
+            elif val >= lo_bound + band:
+                row.append("█", style=pct_color(val))
+            elif val > lo_bound or level == 0:
+                frac = max(0.0, (val - lo_bound) / band)
+                row.append(SPARK_CHARS[max(0, min(7, int(frac * 8)))], style=pct_color(val))
+            else:
+                row.append(" ", style=BAR_EMPTY)
+        rows.append(row)
 
     header = Text()
     header.append("Session history", style="bold")
+    header.append("  0–100%", style=DIM)
     right = Text(f"last {fmt_span(int(span))}", style=DIM)
     pad = max(2, width - header.cell_len - right.cell_len)
-    return Group(Text.assemble(header, " " * pad, right), row)
+    return Group(Text.assemble(header, " " * pad, right), *rows)
 
 
 def usage_bar(pct: float | None, color: str, width: int) -> Text:
@@ -806,6 +864,7 @@ def main() -> None:
         created_flag = flag
 
     state = State()
+    load_history(state)
     stop = threading.Event()
     thread = threading.Thread(
         target=poll_loop, args=(state, max(args.interval, 30), stop, args.notify), daemon=True
@@ -827,6 +886,7 @@ def main() -> None:
                 live.update(Align.center(render(state, console), vertical="middle"))
                 stop.wait(0.5)
     finally:
+        save_history(state)
         if created_flag is not None:
             created_flag.unlink(missing_ok=True)
 
