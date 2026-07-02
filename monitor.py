@@ -579,47 +579,44 @@ def compute_pace(samples: list[tuple[float, float]] | None, now_ts: float) -> fl
     return (p1 - p0) / (t1 - t0) * 3600
 
 
-def fmt_span(secs: int) -> str:
-    hours, rem = divmod(secs, 3600)
-    mins = rem // 60
-    if hours and mins:
-        return f"{hours}h {mins}m"
-    if hours:
-        return f"{hours}h"
-    return f"{mins}m"
+SPARK_ROWS = 3           # chart height; each row covers a third of 0-100%
+WINDOW_LEN = 5 * 3600    # the chart's x-axis spans one full 5h window
 
 
-SPARK_ROWS = 3  # chart height; each row covers a third of 0-100%
+def render_sparkline(
+    samples: list[tuple[float, float]], width: int, now_ts: float, window_end: float | None
+) -> Group | None:
+    """Chart of the CURRENT 5h window, reset boundary to reset boundary.
 
-
-def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: float) -> Group | None:
-    if len(samples) < 2:
+    Fills left to right as the window progresses; dots mark elapsed time with
+    no data (monitor wasn't running), blank space is the window's remainder.
+    """
+    if window_end is None or len(samples) < 2:
         return None
-    span = now_ts - samples[0][0]
-    if span < 120:
+    window_start = window_end - WINDOW_LEN
+    bucket = WINDOW_LEN / width
+
+    filled: dict[int, float] = {}
+    in_window = 0
+    for t, p in samples:  # sorted by time; last sample in a bucket wins
+        if t < window_start or t > now_ts:
+            continue
+        in_window += 1
+        filled[min(width - 1, int((t - window_start) / bucket))] = p
+    if in_window < 2:
         return None
-    gaps = sorted(b[0] - a[0] for a, b in zip(samples, samples[1:]))
-    median_gap = gaps[len(gaps) // 2]
-    bucket = max(span / width, median_gap, 30.0)
-    n = min(width, int(span / bucket) + 1)
 
-    cells: list[float | None] = []
-    for i in range(n):
-        lo = now_ts - (n - i) * bucket
-        hi = lo + bucket
-        val = None
-        for t, p in samples:
-            if lo <= t < hi:
-                val = p
-        cells.append(val)
-
+    elapsed_buckets = min(width, int((now_ts - window_start) / bucket) + 1)
     band = 100.0 / SPARK_ROWS
     rows = []
     for level in range(SPARK_ROWS - 1, -1, -1):  # top band first
         lo_bound = level * band
         row = Text()
-        for val in cells:
-            if val is None:
+        for i in range(width):
+            val = filled.get(i)
+            if i >= elapsed_buckets:
+                row.append(" ")  # window hasn't gotten here yet
+            elif val is None:
                 row.append("·" if level == 0 else " ", style=BAR_EMPTY)
             elif val >= lo_bound + band:
                 row.append("█", style=pct_color(val))
@@ -633,7 +630,9 @@ def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: flo
     header = Text()
     header.append("Session history", style="bold")
     header.append("  0–100%", style=DIM)
-    right = Text(f"last {fmt_span(int(span))}", style=DIM)
+    start_clock = fmt_clock(datetime.fromtimestamp(window_start, tz=timezone.utc))
+    end_clock = fmt_clock(datetime.fromtimestamp(window_end, tz=timezone.utc))
+    right = Text(f"{start_clock} → {end_clock}", style=DIM)
     pad = max(2, width - header.cell_len - right.cell_len)
     return Group(Text.assemble(header, " " * pad, right), *rows)
 
@@ -755,8 +754,9 @@ def render(state: State, console: Console) -> Panel:
         body.append(Text())
 
     session_hist = history.get("session") or history.get("five_hour")
-    if session_hist:
-        spark = render_sparkline(session_hist, width, now_ts)
+    session_lim = next((l for l in limits if l.kind in ("session", "five_hour")), None)
+    if session_hist and session_lim is not None and session_lim.resets_at is not None:
+        spark = render_sparkline(session_hist, width, now_ts, session_lim.resets_at.timestamp())
         if spark is not None:
             body.append(spark)
             body.append(Text())
