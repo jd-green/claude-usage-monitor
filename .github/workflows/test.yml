@@ -1,0 +1,17 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: pytest (monitor logic)
+        run: uv run --python 3.12 --with pytest --with "rich>=13.7" pytest tests/ -q
+      - name: shell tests (statusline-dispatch)
+        run: sh tests/test_dispatch.sh

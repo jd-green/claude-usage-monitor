@@ -175,6 +175,19 @@ poll relaxes to every 5 minutes while the feed is fresh. When the API does
 per-session polling entirely, which makes the monitor's own refreshes far more
 reliable.
 
+## Testing
+
+```sh
+uv run --python 3.12 --with pytest --with "rich>=13.7" pytest tests/ -q
+sh tests/test_dispatch.sh
+```
+
+The pytest suite covers the parsing, merge, pace, event, sparkline, and
+persistence logic plus footer rendering states — no network or Keychain
+access. The shell suite runs `statusline-dispatch` in an isolated `HOME`
+with a stubbed `npx`, asserting mode selection, feed writing, and the
+run-ccstatusline-exactly-once invariant. Both run in CI on every push.
+
 ## Files
 
 | File | Purpose |
