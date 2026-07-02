@@ -7,4 +7,4 @@
 SELF="$0"
 [ -L "$SELF" ] && SELF="$(readlink "$SELF")"
 DIR="$(cd "$(dirname "$SELF")" && pwd)"
-exec uv run "$DIR/monitor.py" --lite-statusline "$@"
+exec uv run "$DIR/monitor.py" --lite-statusline --notify "$@"

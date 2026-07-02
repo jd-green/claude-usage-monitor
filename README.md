@@ -74,6 +74,7 @@ uv run monitor.py
 | --- | --- | --- |
 | `--interval N` | 60 | Poll interval in seconds (min 30) |
 | `--once` | — | Fetch once, print the raw JSON payload, exit |
+| `--notify` | — | Send a notification (macOS + tmux message) on threshold crossings (80%/95%), window resets, and `◂ limiting` changes |
 | `--lite-statusline` | — | Switch the statusline to lite (context info only, no usage polling) while the monitor runs; restored on exit |
 | `--mute-statusline` | — | Hide the Claude Code statusline entirely while the monitor runs; restored on exit |
 
@@ -87,8 +88,27 @@ uv run monitor.py
 - **Week · [model]** — a model-scoped weekly limit (e.g. Fable/Opus) when your
   plan has one. The `◂ limiting` tag marks the limit Anthropic currently
   considers the active constraint.
+- **▸ pace** — burn rate over the last 45 minutes, plus a projection: either
+  `~64% at reset` (you'll clear it) or `hits 100% ~3:40 pm, before reset`
+  (you won't). Appears once a few minutes of samples accumulate; measurement
+  restarts automatically after a window reset.
+- **Session history** — a sparkline of the 5h window over the last few hours
+  (up to 6h, in memory only), colored by utilization; resets show as drops.
 - Bar colors shift green → yellow → orange → red as utilization climbs (and
   follow the API's severity flag when it escalates).
+
+## Notifications
+
+With `--notify` (included in the `claude-usage` wrapper by default), the
+monitor sends a macOS notification and flashes a tmux status message — but
+only on state *transitions*, never repeatedly:
+
+- a window crosses 80% or 95% (upward),
+- a window resets,
+- the `◂ limiting` tag moves to a different window.
+
+Remove `--notify` from the `claude-usage` wrapper if you'd rather it stay
+quiet.
 
 ## Statusline modes
 

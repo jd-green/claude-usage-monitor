@@ -22,10 +22,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich import box
@@ -68,6 +69,13 @@ SEVERITY_STYLES = {
     "exceeded": "#e05252",
     "limited": "#e05252",
 }
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+HISTORY_SPAN = 6 * 3600        # keep 6h of samples in memory
+PACE_LOOKBACK = 45 * 60        # burn rate measured over the last 45 min
+PACE_MIN_SPAN = 5 * 60         # ... but only once samples span 5+ min
+NOTIFY_THRESHOLDS = (95, 80)   # notify on upward crossings, highest first
+RESET_DROP = 20                # a drop this large (in points) counts as a window reset
 
 
 def prettify_key(key: str) -> str:
@@ -237,6 +245,7 @@ def parse_credits(payload: dict) -> Credits:
 class State:
     limits: list[Limit] = field(default_factory=list)
     credits: Credits = field(default_factory=Credits)
+    history: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # kind -> [(epoch, pct)]
     subscription: str = ""
     fetched_at: datetime | None = None
     status: str = "starting…"
@@ -244,11 +253,45 @@ class State:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+# ------------------------------------------------------------- notifications
+
+
+def detect_events(prev: list[Limit], new: list[Limit]) -> list[str]:
+    """State transitions worth interrupting someone for — never steady-state."""
+    events: list[str] = []
+    prev_by = {l.kind: l for l in prev}
+    for lim in new:
+        p = prev_by.get(lim.kind)
+        if p is None or p.percent is None or lim.percent is None:
+            continue
+        for t in NOTIFY_THRESHOLDS:
+            if p.percent < t <= lim.percent:
+                events.append(f"{lim.label} at {lim.percent:.0f}%")
+                break
+        if lim.percent <= p.percent - RESET_DROP:
+            events.append(f"{lim.label} reset — now {lim.percent:.0f}%")
+    prev_active = next((l.kind for l in prev if l.is_active), None)
+    new_active = next((l for l in new if l.is_active), None)
+    if new_active and prev_active and new_active.kind != prev_active:
+        pct = f" ({new_active.percent:.0f}%)" if new_active.percent is not None else ""
+        events.append(f"Now limiting: {new_active.label}{pct}")
+    return events
+
+
+def send_notification(msg: str) -> None:
+    if sys.platform == "darwin":
+        script = f'display notification {json.dumps(msg)} with title "Claude Usage Monitor"'
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+    if os.environ.get("TMUX"):
+        subprocess.run(["tmux", "display-message", "-d", "4000", f"⚠ {msg}"], capture_output=True)
+
+
 # ------------------------------------------------------------------- polling
 
 
-def poll_loop(state: State, interval: int, stop: threading.Event) -> None:
+def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool = False) -> None:
     backoff = 0
+    prev_limits: list[Limit] | None = None
     while not stop.is_set():
         delay = interval
         try:
@@ -256,6 +299,7 @@ def poll_loop(state: State, interval: int, stop: threading.Event) -> None:
             payload = fetch_usage(token)
             limits = parse_limits(payload)
             credits = parse_credits(payload)
+            now_ts = time.time()
             with state.lock:
                 state.limits = limits
                 state.credits = credits
@@ -263,6 +307,18 @@ def poll_loop(state: State, interval: int, stop: threading.Event) -> None:
                 state.fetched_at = datetime.now(timezone.utc)
                 state.status = "live"
                 state.status_style = "green"
+                for lim in limits:
+                    if lim.percent is None:
+                        continue
+                    hist = state.history.setdefault(lim.kind, [])
+                    hist.append((now_ts, lim.percent))
+                    cutoff = now_ts - HISTORY_SPAN
+                    while hist and hist[0][0] < cutoff:
+                        hist.pop(0)
+            if notify and prev_limits is not None:
+                for msg in detect_events(prev_limits, limits):
+                    send_notification(msg)
+            prev_limits = limits
             backoff = 0
         except RateLimited as exc:
             with state.lock:
@@ -331,12 +387,7 @@ def fmt_ago(then: datetime, now: datetime) -> str:
     return f"{secs // 60}m ago"
 
 
-def util_color(limit: Limit) -> str:
-    if limit.severity in SEVERITY_STYLES:
-        return SEVERITY_STYLES[limit.severity]
-    pct = limit.percent
-    if pct is None:
-        return DIM
+def pct_color(pct: float) -> str:
     if pct >= 90:
         return "#e05252"
     if pct >= 75:
@@ -344,6 +395,71 @@ def util_color(limit: Limit) -> str:
     if pct >= 50:
         return "#d9a765"
     return "#8fbf6f"
+
+
+def util_color(limit: Limit) -> str:
+    if limit.severity in SEVERITY_STYLES:
+        return SEVERITY_STYLES[limit.severity]
+    if limit.percent is None:
+        return DIM
+    return pct_color(limit.percent)
+
+
+def compute_pace(samples: list[tuple[float, float]] | None, now_ts: float) -> float | None:
+    """Percent-per-hour over the recent lookback, restarted after any reset."""
+    if not samples:
+        return None
+    recent = [(t, p) for t, p in samples if t >= now_ts - PACE_LOOKBACK]
+    start = 0
+    for i in range(1, len(recent)):
+        if recent[i][1] < recent[i - 1][1] - 10:  # window reset mid-lookback
+            start = i
+    recent = recent[start:]
+    if len(recent) < 3 or recent[-1][0] - recent[0][0] < PACE_MIN_SPAN:
+        return None
+    (t0, p0), (t1, p1) = recent[0], recent[-1]
+    return (p1 - p0) / (t1 - t0) * 3600
+
+
+def fmt_span(secs: int) -> str:
+    hours, rem = divmod(secs, 3600)
+    mins = rem // 60
+    if hours and mins:
+        return f"{hours}h {mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
+def render_sparkline(samples: list[tuple[float, float]], width: int, now_ts: float) -> Group | None:
+    if len(samples) < 2:
+        return None
+    span = now_ts - samples[0][0]
+    if span < 120:
+        return None
+    gaps = sorted(b[0] - a[0] for a, b in zip(samples, samples[1:]))
+    median_gap = gaps[len(gaps) // 2]
+    bucket = max(span / width, median_gap, 30.0)
+    n = min(width, int(span / bucket) + 1)
+
+    row = Text()
+    for i in range(n):
+        lo = now_ts - (n - i) * bucket
+        hi = lo + bucket
+        val = None
+        for t, p in samples:
+            if lo <= t < hi:
+                val = p
+        if val is None:
+            row.append("·", style=BAR_EMPTY)
+        else:
+            row.append(SPARK_CHARS[min(7, int(val / 100 * 8))], style=pct_color(val))
+
+    header = Text()
+    header.append("Session history", style="bold")
+    right = Text(f"last {fmt_span(int(span))}", style=DIM)
+    pad = max(2, width - header.cell_len - right.cell_len)
+    return Group(Text.assemble(header, " " * pad, right), row)
 
 
 def usage_bar(pct: float | None, color: str, width: int) -> Text:
@@ -361,7 +477,31 @@ def usage_bar(pct: float | None, color: str, width: int) -> Text:
     return bar
 
 
-def render_limit(limit: Limit, now: datetime, width: int) -> Group:
+def pace_line(limit: Limit, rate: float | None, now: datetime) -> Text | None:
+    if rate is None or limit.percent is None:
+        return None
+    line = Text()
+    line.append("▸ ", style=DIM)
+    if abs(rate) < 0.1:
+        line.append("pace steady", style=DIM)
+        return line
+    line.append(f"pace {rate:+.1f}%/h", style=DIM)
+    if rate > 0 and limit.resets_at is not None:
+        hours_left = (limit.resets_at - now).total_seconds() / 3600
+        if hours_left > 0:
+            projected = limit.percent + rate * hours_left
+            line.append("  ·  ", style=DIM)
+            if projected >= 100:
+                hit = now + timedelta(hours=(100 - limit.percent) / rate)
+                line.append(f"hits 100% ~{fmt_clock(hit)}, before reset", style=f"bold {pct_color(95)}")
+            else:
+                line.append("~", style=DIM)
+                line.append(f"{projected:.0f}%", style=pct_color(projected))
+                line.append(" at reset", style=DIM)
+    return line
+
+
+def render_limit(limit: Limit, now: datetime, width: int, rate: float | None = None) -> Group:
     color = util_color(limit)
     pct_txt = f"{limit.percent:.1f}%" if limit.percent is not None else "—"
 
@@ -394,7 +534,11 @@ def render_limit(limit: Limit, now: datetime, width: int) -> Group:
         reset.append(" " * pad2)
         reset.append(clock, style=DIM)
 
-    return Group(line1, usage_bar(limit.percent, color, width), reset)
+    parts = [line1, usage_bar(limit.percent, color, width), reset]
+    pace = pace_line(limit, rate, now)
+    if pace is not None:
+        parts.append(pace)
+    return Group(*parts)
 
 
 def render(state: State, console: Console) -> Panel:
@@ -404,10 +548,12 @@ def render(state: State, console: Console) -> Panel:
     with state.lock:
         limits = list(state.limits)
         credits = state.credits
+        history = {k: list(v) for k, v in state.history.items()}
         subscription = state.subscription
         status = state.status
         status_style = state.status_style
         fetched = state.fetched_at
+    now_ts = now.timestamp()
 
     body: list = [Text()]
 
@@ -426,8 +572,16 @@ def render(state: State, console: Console) -> Panel:
         body.append(Align.center(Text("waiting for first response…", style=DIM)))
         body.append(Text())
     for limit in limits:
-        body.append(render_limit(limit, now, width))
+        rate = compute_pace(history.get(limit.kind), now_ts)
+        body.append(render_limit(limit, now, width, rate))
         body.append(Text())
+
+    session_hist = history.get("session") or history.get("five_hour")
+    if session_hist:
+        spark = render_sparkline(session_hist, width, now_ts)
+        if spark is not None:
+            body.append(spark)
+            body.append(Text())
 
     if credits.enabled and credits.used is not None:
         line = Text()
@@ -478,13 +632,16 @@ def main() -> None:
         action="store_true",
         help="switch the statusline to lite (context info only, no usage polling) while the monitor runs (restored on exit)",
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="send a notification (macOS + tmux message) on threshold crossings, window resets, and limiting changes",
+    )
     args = parser.parse_args()
 
     console = Console()
 
     if args.once:
-        import time
-
         token, _ = read_access_token()
         for attempt in range(8):
             try:
@@ -505,7 +662,9 @@ def main() -> None:
 
     state = State()
     stop = threading.Event()
-    thread = threading.Thread(target=poll_loop, args=(state, max(args.interval, 30), stop), daemon=True)
+    thread = threading.Thread(
+        target=poll_loop, args=(state, max(args.interval, 30), stop, args.notify), daemon=True
+    )
     thread.start()
 
     def bye(*_):
