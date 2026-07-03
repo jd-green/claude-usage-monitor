@@ -400,12 +400,10 @@ def proc(rc=0, out="", err=""):
     return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
 
 
-def test_kc_quote_escaping():
-    assert acc._kc_quote('a"b\\c') == '"a\\"b\\\\c"'
-    assert acc._kc_quote("plain") == '"plain"'
-
-
-def test_keychain_write_builds_stdin_command(monkeypatch):
+def test_keychain_write_passes_secret_untouched_on_argv(monkeypatch):
+    # Secret goes verbatim as the -w value on argv, never mangled or truncated
+    # — the old `security -i` line buffer capped writes at ~4 KB and corrupted
+    # larger blobs. A large payload with quotes/backslashes must round-trip.
     seen = {}
 
     def fake_security(args, stdin=None):
@@ -413,26 +411,30 @@ def test_keychain_write_builds_stdin_command(monkeypatch):
         return proc()
 
     monkeypatch.setattr(acc, "_security", fake_security)
-    acc._keychain_write("svc", "acct", 'secret-with-"quote"')
-    assert seen["args"] == ["-i"]  # secret travels via stdin, never argv
-    assert '\\"quote\\"' in seen["stdin"]
-    assert seen["stdin"].count("\n") == 1 and seen["stdin"].endswith("\n")
-
-
-def test_keychain_write_rejects_newlines(monkeypatch):
-    monkeypatch.setattr(acc, "_security", lambda *a, **k: pytest.fail("must not reach security"))
-    with pytest.raises(acc.AccountError, match="newline"):
-        acc._keychain_write("svc", "acct", "line1\nline2")
+    big = json.dumps({"accessToken": 'x"y\\z' * 4000})  # ~24 KB, well past the -i cap
+    acc._keychain_write("svc", "acct", big)
+    assert seen["args"] == ["add-generic-password", "-U", "-s", "svc", "-a", "acct", "-w", big]
+    assert seen["args"][-1] == big  # untruncated, unescaped
+    assert seen["stdin"] is None  # nothing on the stdin command channel
 
 
 def test_keychain_write_error_never_echoes_payload(monkeypatch):
-    # a parse error from `security -i` echoes the command (with the secret);
-    # only security's own "security:"-prefixed diagnostics may be surfaced
+    # only security's own "security:"-prefixed diagnostics may be surfaced,
+    # never a line that could carry the secret
     echo = 'unknown command: add-generic-password -w "sk-ant-oat01-SECRET"'
     monkeypatch.setattr(acc, "_security", lambda *a, **k: proc(rc=1, err=echo))
     with pytest.raises(acc.AccountError) as exc_info:
         acc._keychain_write("svc", "acct", "sk-ant-oat01-SECRET")
     assert "SECRET" not in str(exc_info.value)
+
+    # a "security:"-prefixed line that echoes a NON-sk-ant secret fragment
+    # (e.g. an mcpOAuth token) must still be suppressed via the secret check
+    secret = json.dumps({"mcpOAuth": {"figma": {"accessToken": "mcp-tok-abcdef0123456789"}}})
+    leaky = f'security: internal error near mcp-tok-abcdef0123456789'
+    monkeypatch.setattr(acc, "_security", lambda *a, **k: proc(rc=1, err=leaky))
+    with pytest.raises(acc.AccountError) as exc_info:
+        acc._keychain_write("svc", "acct", secret)
+    assert "mcp-tok" not in str(exc_info.value)
 
     monkeypatch.setattr(
         acc, "_security",
@@ -467,12 +469,18 @@ def test_keychain_live_account_paths(monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="real Keychain only on macOS")
 def test_real_keychain_roundtrip(tmp_path, monkeypatch):
-    """End-to-end proof that the `security -i` escaping round-trips a token
-    with quotes/backslashes — the one thing the fakes above can't prove."""
+    """End-to-end proof the real Keychain round-trips a token with
+    quotes/backslashes AND a payload far larger than the old `security -i`
+    ~4 KB command-line buffer — the exact case that truncated a live login
+    into an unterminated string. The fakes above can't prove either."""
     monkeypatch.setattr(acc, "SLOT_SERVICE", "claude-usage-monitor.test-suite")
     monkeypatch.setattr(acc, "SLOTS_DIR", tmp_path / "slots")  # rescue files
     payload = {"claudeAiOauth": {"accessToken": 'tok-with-"quote"-and-\\slash',
-                                 "expiresAt": 1234567890123}}
+                                 "expiresAt": 1234567890123},
+               # a real live blob with accumulated mcpOAuth tokens easily
+               # exceeds 4 KB; simulate that bulk so truncation would corrupt
+               "mcpOAuth": {f"srv{i}": {"accessToken": 'sk-"x"\\y' * 40} for i in range(20)}}
+    assert len(json.dumps(payload)) > 4096  # guard the regression is actually exercised
     try:
         acc.slot_write("kc-test", payload)
         assert acc.slot_read("kc-test") == payload
@@ -598,6 +606,41 @@ def test_security_hint_never_echoes_token(monkeypatch):
     class OK:
         stderr = "security: SecKeychainItemModifyContent failed"
     assert "SecKeychainItemModifyContent" in acc._security_error_hint(OK())
+
+    # a non-sk-ant secret fragment echoed on a "security:" line is redacted
+    # only when the secret is supplied
+    class Leak:
+        stderr = "security: error near tok-mcp-0123456789abcdef-more"
+    secret = "tok-mcp-0123456789abcdef-more"
+    assert acc._security_error_hint(Leak(), secret) == ""
+    assert "tok-mcp" in acc._security_error_hint(Leak())  # no secret given: not redacted
+
+    # an echoed fragment at an offset not aligned to the scan stride must still
+    # be caught (windows of the line are tested against the secret)
+    unaligned = "0123456789abcdefghij-token-tail"
+    class Off:
+        stderr = "security: parse error near 123456789abcdefghij-token"  # unaligned[1:]
+    assert acc._security_error_hint(Off(), unaligned) == ""
+
+
+def test_valid_slot_name_and_dash_rejection(home):
+    assert acc.valid_slot_name("empractica-james")
+    assert acc.valid_slot_name("a_b-1")
+    assert acc.valid_slot_name("_x")      # leading underscore: not a flag, kept for back-compat
+    assert not acc.valid_slot_name("-x")  # leading dash: could reach security's getopt
+    assert not acc.valid_slot_name("")
+    assert not acc.valid_slot_name("a b")
+    # a dash-leading name from the index is dropped, and _slot_path refuses it
+    with pytest.raises(acc.AccountError, match="invalid account name"):
+        acc._slot_path("-evil", ".json")
+
+
+def test_cmd_save_name_always_starts_alnum(home, monkeypatch):
+    # a user-supplied name that sanitizes to a leading dash must be normalized
+    set_live(home, "a@x.com", UUID_A, "a")
+    acc.cmd_save("--weird--name")
+    names = [a.name for a in acc.load_index()]
+    assert names and all(acc.valid_slot_name(n) for n in names)
 
 
 def test_save_requires_account_uuid(home):

@@ -87,20 +87,38 @@ def _security(args: list[str], stdin: str | None = None) -> subprocess.Completed
         )
     except subprocess.TimeoutExpired:
         raise AccountError("keychain call timed out — is the Keychain locked or showing a prompt?")
+    except OSError as exc:  # e.g. E2BIG if a blob ever exceeds ARG_MAX, or security missing
+        raise AccountError(f"could not run security: {exc}") from exc
 
 
-def _security_error_hint(proc: subprocess.CompletedProcess) -> str:
-    """First stderr line, but only security's own diagnostics — a parse error
-    from `security -i` can echo the command line, which contains the secret."""
+def _security_error_hint(proc: subprocess.CompletedProcess, secret: str | None = None) -> str:
+    """First stderr line, but only security's own diagnostics, never a line
+    that could carry the written secret.
+
+    security's `add-generic-password` doesn't echo its argv on failure, but as
+    defense-in-depth the line is dropped if it contains any fragment of the
+    secret being written — the payload is a whole JSON blob (mcpOAuth tokens,
+    identity PII), so a token-shape allowlist alone would not be enough.
+    """
     first = (proc.stderr or "").strip().splitlines()[:1]
-    if first and first[0].startswith("security:") and "sk-ant" not in first[0]:
-        return f" ({first[0][:120]})"
-    return ""
+    if not first or not first[0].startswith("security:"):
+        return ""
+    line = first[0]
+    if _leaks_secret(line, secret):
+        return ""
+    return f" ({line[:120]})"
 
 
-def _kc_quote(s: str) -> str:
-    """Quote for the `security -i` command parser (backslash escapes)."""
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+def _leaks_secret(line: str, secret: str | None) -> bool:
+    """Would surfacing `line` reveal any part of `secret`? Rejects the
+    hardcoded token shape and any >=16-char run the line shares with the
+    secret. Windows of `line` (short) are tested against `secret`, so any
+    echoed fragment is caught regardless of its offset within the secret."""
+    if "sk-ant" in line:
+        return True
+    if not secret:
+        return False
+    return any(line[i:i + 16] in secret for i in range(len(line) - 15))
 
 
 def _keychain_read(service: str, account: str | None = None) -> str | None:
@@ -112,18 +130,20 @@ def _keychain_read(service: str, account: str | None = None) -> str | None:
 
 
 def _keychain_write(service: str, account: str, secret: str) -> None:
-    # `security -i` reads the command from stdin, keeping the secret out of
-    # argv (visible to `ps`).
-    cmd = " ".join(
-        ["add-generic-password", "-U", "-s", _kc_quote(service), "-a", _kc_quote(account),
-         "-w", _kc_quote(secret)]
-    )
-    if "\n" in cmd or "\r" in cmd:  # would break the line protocol and echo back
-        raise AccountError("refusing keychain write: payload contains a newline")
-    proc = _security(["-i"], stdin=cmd + "\n")
+    # The secret goes on argv (-w VALUE). The earlier `security -i` path kept
+    # it out of `ps`, but that interactive parser has a ~4 KB command-line
+    # buffer: a larger blob — e.g. a live login carrying accumulated mcpOAuth
+    # tokens — was silently truncated into an unterminated string, corrupting
+    # the stored credential (and its parser echoed the truncated secret to
+    # stderr). argv is robust at any size. The exposure is to `ps` while
+    # `security` runs (bounded by the 20s call timeout, typically a few ms),
+    # and only to same-user/root processes — which can already read this item
+    # via `security find-generic-password -w` with no prompt, so it adds no
+    # meaningful leak on a single-user machine.
+    proc = _security(["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret])
     if proc.returncode != 0:
         raise AccountError(f"keychain write failed, security exited {proc.returncode}"
-                           + _security_error_hint(proc))
+                           + _security_error_hint(proc, secret))
 
 
 def _keychain_delete(service: str, account: str) -> None:
@@ -151,10 +171,18 @@ def _keychain_live_account() -> str:
 # ---------------------------------------------------------------- slot store
 
 
+def valid_slot_name(name: str) -> bool:
+    # Reject a leading '-': it would reach `security` as the token right after
+    # `-a`, where its getopt could misread it as a flag. A leading '_' is fine
+    # (not a flag) and was accepted by older versions, so keep allowing it.
+    # Interior '-'/'_' are fine.
+    return bool(name) and name[0] != "-" and all(c.isalnum() or c in "-_" for c in name)
+
+
 def _slot_path(name: str, suffix: str) -> Path:
     # cmd_save sanitizes new names, but the index file is plain user-editable
     # JSON — never let a hand-edited name escape SLOTS_DIR
-    if not name or not all(c.isalnum() or c in "-_" for c in name):
+    if not valid_slot_name(name):
         raise AccountError(f"invalid account name {name!r}")
     return SLOTS_DIR / f"{name}{suffix}"
 
@@ -252,7 +280,7 @@ def load_index() -> list[Account]:
             account = Account(name, str(entry.get("email", "")), str(entry.get("accountUuid", "")))
         except (TypeError, KeyError):
             continue
-        if not name or not all(c.isalnum() or c in "-_" for c in name):
+        if not valid_slot_name(name):
             continue  # a tampered name could point slot paths outside SLOTS_DIR
         out.append(account)
     return out
@@ -553,7 +581,9 @@ def cmd_save(name: str | None) -> None:
     uuid = oa.get("accountUuid", "")
     if not name:
         name = (email.split("@")[0] or "account").lower()
-    name = "".join(c for c in name.lower() if c.isalnum() or c in "-_") or "account"
+    # strip anything but alnum/-/_, then any leading '-' so the name can't be
+    # read as a flag by security's getopt (see valid_slot_name)
+    name = "".join(c for c in name.lower() if c.isalnum() or c in "-_").lstrip("-") or "account"
     accounts = load_index()
     existing = next((a for a in accounts if a.name == name), None)
     if existing and existing.account_uuid and uuid and existing.account_uuid != uuid:
