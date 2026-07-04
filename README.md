@@ -89,6 +89,7 @@ uv run monitor.py
 | `--interval N` | 60 | Poll interval in seconds (min 30) |
 | `--once` | — | Fetch once, print the raw JSON payload, exit |
 | `--notify` | — | Send a notification (macOS + tmux message) on threshold crossings (80%/95%), window resets, and `◂ limiting` changes |
+| `--autorotate` | — | When the live login hits 100%, switch to a saved account confirmed to have headroom (needs ≥ 2 slots — see *Multiple accounts*) |
 | `--lite-statusline` | — | Switch the statusline to lite (context info only, no usage polling) while the monitor runs; restored on exit |
 | `--mute-statusline` | — | Hide the Claude Code statusline entirely while the monitor runs; restored on exit |
 
@@ -115,8 +116,22 @@ uv run monitor.py
   (`~/.claude/usage-monitor-history.json`).
 - **Accounts** — one row per saved login (see *Multiple accounts*): `●` marks
   the live one, each row shows that account's window percentages, and a
-  session at ≥90% shows its reset countdown. Appears once a second account
-  is saved.
+  session at ≥90% shows its reset countdown. Non-live rows also show usage
+  credits when enabled — `$X left` when the account has a spend cap or prepaid
+  balance, otherwise `$X used` (uncapped pay-as-you-go accounts, and orgs that
+  meter the cap centrally, report no per-member cap). Appears once a second
+  account is saved.
+- **Extra usage credits** — when credits are enabled but your plan still has
+  headroom, a compact line shows credit spend to date (and available/today
+  when known).
+- **Drawing on usage credits** — once plan quota is exhausted (the window
+  Anthropic flags as limiting is pinned at 100% — or every known window, when
+  nothing is flagged) and usage spills onto credits, the bars are replaced by
+  today's credit spend, big and centred, with total spend-to-date and the
+  reset countdown for when plan quota (and free usage) returns. Today's
+  figure counts from the first sample the monitor sees each day, per login
+  (a switch restarts it), and persists across restarts
+  (`~/.claude/usage-monitor-credits.json`).
 - Bar colors shift green → yellow → orange → red as utilization climbs (and
   follow the API's severity flag when it escalates).
 
@@ -160,10 +175,12 @@ endpoint the CLI uses (and the rotated tokens are persisted).
 
 Two things to know:
 
-- **Running sessions keep their old login** (tokens are in memory) — a switch
-  applies to `claude` sessions started afterwards. The switch clears the
-  passive usage feed so leftover statusline snapshots from old-login sessions
-  don't bleed into the monitor; restart those sessions when convenient.
+- **New sessions get the new login at once; running sessions follow at their
+  next retry.** A running session holds its tokens in memory, but Claude Code
+  re-reads the credential store when a request retries — so a session blocked
+  on a rate limit resumes on the new login without a restart. The switch also
+  clears the passive usage feed so leftover statusline snapshots from
+  old-login sessions don't bleed into the monitor.
 - **Slot storage is Keychain-native on macOS** (service
   `claude-usage-monitor.account`, one item per slot). On Linux, slots are
   `0600` files under `~/.claude/usage-monitor-accounts/`. The index file
@@ -182,16 +199,38 @@ subscription has headroom before you hit a wall:
 
 ```
 Accounts  ·  usage per login
-● james    5h 47% · wk 32% · fable 27%                        live
-○ spare    5h 91% ⟳42m 10s · wk 12%                           3m ago
+● james    5h 47%           wk 32%  fable 27%                   live
+○ spare    5h 91% ⟳42m 10s  wk 12%  fable 9%   $21.50 left    3m ago
 ```
 
 The `●` live row mirrors the main panel's merged numbers. Every other slot is
 polled on its own token every 5 minutes (each account has its own rate-limit
 budget on the usage endpoint, so this doesn't compete with the main poll),
-with stale tokens auto-refreshed. A session window at ≥90% shows its reset
-countdown inline. Rows fall back to `rate limited` / `needs /login` /
-`waiting…` when data isn't available.
+with stale tokens auto-refreshed. Columns align across rows and drop from the
+right when the pane is narrow; a session window at ≥90% shows its reset
+countdown inline, and non-live rows show credit headroom (`$X left` / `$X
+used`) when usage credits are enabled. Rows fall back to `rate limited` /
+`needs /login` / `waiting…` when data isn't available.
+
+### Auto-rotate
+
+Add `--autorotate` and the monitor acts on that information instead of just
+showing it: when the live login's fullest window reaches 100%, it tries the
+saved logins with the most known headroom first and switches to the first one
+a fresh poll confirms has room — so blocked sessions resume on the new
+account at their next retry (see *Multiple accounts* above). The Accounts
+header gains a `⟳ auto-rotate` tag and the panel notes each switch:
+
+```
+⟳ 14:02 auto-rotated to spare — previous login hit 100%
+```
+
+It's deliberately paranoid about flapping: switches respect a 2-minute
+cooldown, only numbers fetched after the previous switch count, and the live
+login's 100% is itself re-confirmed against the API before any switch — so a
+stale snapshot (say, from a window that just reset) never triggers one. If
+every saved login is maxed, the note says so and the monitor waits for the
+earliest reset.
 
 ## Statusline modes
 
@@ -254,11 +293,12 @@ uv run --python 3.12 --with pytest --with "rich>=13.7" pytest tests/ -q
 sh tests/test_dispatch.sh
 ```
 
-The pytest suite covers the parsing, merge, pace, event, sparkline, and
-persistence logic plus footer rendering states, and the account router's
-slot store, switching, rotation, and token-refresh flows — no network or
-Keychain access (the accounts tests run against the file backend in a tmp
-dir with stubbed HTTP). The shell suite runs `statusline-dispatch` in an isolated `HOME`
+The pytest suite covers the parsing (limits and credit spend), merge, pace,
+event, sparkline, and persistence logic, the credits views and auto-rotate
+flow, plus footer rendering states, and the account router's slot store,
+switching, rotation, and token-refresh flows — no network or Keychain access
+(the accounts tests run against the file backend in a tmp dir with stubbed
+HTTP). The shell suite runs `statusline-dispatch` in an isolated `HOME`
 with a stubbed `npx`, asserting mode selection, feed writing, and the
 run-ccstatusline-exactly-once invariant. Both run in CI on every push.
 

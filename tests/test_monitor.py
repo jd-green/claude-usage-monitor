@@ -74,6 +74,16 @@ def test_parse_limits_unknown_kind_last():
     assert limits[-1].label == "Mystery New"
 
 
+def test_parse_limits_tolerates_garbage_entries_and_scope():
+    payload = {"limits": [
+        "not-a-dict",
+        {"kind": "weekly_scoped", "percent": 5, "scope": "bad-shape"},
+        {"kind": "weekly_scoped", "percent": 6, "scope": {"model": "bad-model", "surface": "api"}},
+    ]}
+    limits = m.parse_limits(payload)
+    assert [l.label for l in limits] == ["Week · scoped", "Week · api"]
+
+
 def test_parse_dt_variants():
     assert m.parse_dt("2026-07-02T18:10:00Z") == dt(1783015800)
     assert m.parse_dt(1783015800) == dt(1783015800)
@@ -84,9 +94,46 @@ def test_parse_dt_variants():
 
 def test_parse_credits_disabled_and_enabled():
     assert m.parse_credits(API_PAYLOAD).enabled is False
-    payload = {"extra_usage": {"is_enabled": True, "used_credits": 12.5, "monthly_limit": 50}}
+    # canonical shape: spend.used is a money object in minor units (14179 = $141.79)
+    payload = {"spend": {"enabled": True,
+                         "used": {"amount_minor": 14179, "currency": "USD", "exponent": 2}}}
     credits = m.parse_credits(payload)
-    assert credits.enabled and credits.used == 12.5 and credits.limit == 50
+    assert credits.enabled and credits.used == 141.79 and credits.currency == "USD"
+
+
+def test_parse_credits_extra_usage_minor_units():
+    # extra_usage.used_credits/monthly_limit are minor units scaled by decimal_places
+    payload = {"extra_usage": {"is_enabled": True, "used_credits": 1250.0,
+                               "monthly_limit": 5000, "decimal_places": 2}}
+    credits = m.parse_credits(payload)
+    assert credits.enabled and credits.used == 12.5 and credits.limit == 50.0
+    assert credits.available == 37.5  # 50 cap - 12.5 used
+
+
+def test_parse_credits_spend_beats_extra_usage():
+    # both blocks present: spend (canonical) wins
+    payload = {"spend": {"enabled": True,
+                         "used": {"amount_minor": 999, "exponent": 2, "currency": "USD"}},
+               "extra_usage": {"is_enabled": True, "used_credits": 4200.0, "decimal_places": 2}}
+    assert m.parse_credits(payload).used == 9.99
+
+
+def test_parse_credits_available_prefers_balance():
+    payload = {"spend": {"enabled": True,
+                         "used": {"amount_minor": 1000, "exponent": 2},
+                         "balance": {"amount_minor": 2500, "exponent": 2}}}
+    credits = m.parse_credits(payload)
+    assert credits.balance == 25.0 and credits.available == 25.0  # prepaid balance, not cap-used
+
+
+def test_parse_credits_uncapped_has_no_available():
+    # the real Empractica payload: enabled, used known, every cap/balance null
+    payload = {"extra_usage": {"is_enabled": True, "used_credits": 14179.0, "monthly_limit": None,
+                               "decimal_places": 2, "currency": "USD"},
+               "spend": {"enabled": True, "used": {"amount_minor": 14179, "exponent": 2, "currency": "USD"},
+                         "limit": None, "cap": None, "balance": None}}
+    credits = m.parse_credits(payload)
+    assert credits.used == 141.79 and credits.available is None
 
 
 # ------------------------------------------------------------------ formatting
@@ -182,6 +229,14 @@ def test_detect_events_reset_and_limiting_move():
     assert any(e.startswith("Now limiting: Session") for e in events)
 
 
+def test_detect_events_limiting_move_between_scoped_models():
+    prev = [m.Limit("weekly_scoped", "Week · Fable", 98.0, None, is_active=True),
+            m.Limit("weekly_scoped", "Week · Opus", 40.0, None, is_active=False)]
+    new = [m.Limit("weekly_scoped", "Week · Fable", 98.0, None, is_active=False),
+           m.Limit("weekly_scoped", "Week · Opus", 100.0, None, is_active=True)]
+    assert "Now limiting: Week · Opus (100%)" in m.detect_events(prev, new)
+
+
 def test_detect_events_steady_state_silent():
     prev = [m.Limit("session", "s", 47.0, None, is_active=True)]
     new = [m.Limit("session", "s", 48.0, None, is_active=True)]
@@ -234,6 +289,19 @@ def test_read_feed_garbage_tolerant(tmp_path, monkeypatch):
     assert m.read_feed() is None
 
 
+def test_read_feed_uses_captured_at_for_freshness(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FEED_DIR", tmp_path)
+    write_feed_file(tmp_path, "old-capture",
+                    {"five_hour": {"used_percentage": 99, "resets_at": 2_000_000}},
+                    captured_at=time.time() - m.FEED_MAX_AGE - 30)
+    write_feed_file(tmp_path, "fresh-capture",
+                    {"five_hour": {"used_percentage": 21, "resets_at": 2_000_000}})
+    result = m.read_feed()
+    assert result is not None
+    feed, _ = result
+    assert feed["session"] == (21.0, 2_000_000.0)
+
+
 def test_merge_limits_rules():
     api = [m.Limit("session", "Session · 5h window", 45.0, dt(1_000_000), is_active=True),
            m.Limit("weekly_scoped", "Week · Fable", 38.0, dt(2_000_000))]
@@ -271,6 +339,18 @@ def test_recompute_events_and_history():
     state.feed = {"session": (82.0, NOW)}
     m.recompute(state)
     assert state.history["session"][-1][1] == 82.0
+
+
+def test_recompute_scoped_history_uses_label_identity(monkeypatch):
+    monkeypatch.setattr(m.time, "time", lambda: NOW)
+    state = m.State()
+    state.api_limits = [
+        m.Limit("weekly_scoped", "Week · Fable", 10.0, dt(NOW + 86400)),
+        m.Limit("weekly_scoped", "Week · Opus", 70.0, dt(NOW + 86400)),
+    ]
+    m.recompute(state)
+    assert state.history["weekly_scoped:Week · Fable"] == [(NOW, 10.0)]
+    assert state.history["weekly_scoped:Week · Opus"] == [(NOW, 70.0)]
 
 
 # ------------------------------------------------------------------ sparkline
@@ -350,6 +430,7 @@ def test_poll_loop_success_path(monkeypatch):
 
     monkeypatch.setattr(m, "fetch_usage", fake_fetch)
     monkeypatch.setattr(m, "read_access_token", lambda: ("tok", "max"))
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-live")
     monkeypatch.setattr(m, "send_notification", notes.append)
 
     state = m.State()
@@ -367,6 +448,7 @@ def test_poll_loop_success_path(monkeypatch):
 
     assert state.status == "live" and state.retry_at is None
     assert state.subscription == "max"
+    assert state.credits_owner == "uuid-live"
     assert [p for _, p in state.history["session"]] == [78.0, 96.0, 3.0]
     assert any("at 96%" in n for n in notes)
     assert any("reset — now 3%" in n for n in notes)
@@ -393,6 +475,31 @@ def test_poll_loop_rate_limited_sets_retry_deadline(monkeypatch):
     status, retry_at = snapshots[0]
     assert status.startswith("rate limited")
     assert retry_at is not None and retry_at > time.time()
+
+
+def test_poll_loop_discards_result_when_login_switches_mid_flight(monkeypatch):
+    state = m.State()
+
+    def fake_fetch(token):
+        state.login_epoch += 1  # an auto-rotate lands while this request is in flight
+        return json.loads(json.dumps(API_PAYLOAD))
+
+    monkeypatch.setattr(m, "fetch_usage", fake_fetch)
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok", "max"))
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-live")
+    stop = threading.Event()
+    waits = []
+
+    def wait(t=None):
+        waits.append(t)
+        stop.set()
+        return True
+
+    stop.wait = wait
+    m.poll_loop(state, 30, stop, notify=False)
+    # the response described the OLD login: nothing written, prompt re-poll
+    assert state.api_limits == [] and state.status == "starting…"
+    assert waits[0] == 2
 
 
 # ------------------------------------------------------------------ rendering
@@ -472,6 +579,38 @@ def test_render_accounts_rows_live_and_polled():
     assert lines[2].rstrip().endswith("2m ago")
 
 
+def test_render_accounts_aligns_limit_columns():
+    rows = [
+        m.AccountRow("james", "j@x.io", "uuid-a", is_live=True),
+        m.AccountRow("empractica-jamie", "e@x.io", "uuid-b",
+                     limits=[
+                         m.Limit("session", "Session · 5h window", 100.0, dt(NOW + 3 * 3600 + 57 * 60)),
+                         m.Limit("weekly_all", "Week · all models", 29.0, dt(NOW + 86400)),
+                         m.Limit("weekly_scoped", "Week · Fable", 49.0, dt(NOW + 86400)),
+                     ],
+                     fetched_at=NOW),
+        m.AccountRow("mosaic", "m@x.io", "uuid-c",
+                     limits=[
+                         m.Limit("session", "Session · 5h window", 100.0, dt(NOW + 47 * 60 + 7)),
+                         m.Limit("weekly_all", "Week · all models", 21.0, dt(NOW + 86400)),
+                         m.Limit("weekly_scoped", "Week · Fable", 38.0, dt(NOW + 86400)),
+                     ],
+                     fetched_at=NOW),
+    ]
+    live = [
+        m.Limit("session", "Session · 5h window", 101.0, dt(NOW + 3 * 3600 + 57 * 60)),
+        m.Limit("weekly_all", "Week · all models", 6.0, dt(NOW + 86400)),
+    ]
+    g = m.render_accounts(rows, live, 72, dt(NOW))
+    lines = [r.plain for r in g.renderables[1:]]
+    assert len({line.index("5h") for line in lines}) == 1
+    assert len({line.index("wk") for line in lines}) == 1
+    assert lines[1].index("fable") == lines[2].index("fable")
+    assert "empractica-jamie5h" not in lines[1]
+    assert lines[0].rstrip().endswith("live")
+    assert lines[1].rstrip().endswith("just now")
+
+
 def test_render_accounts_hot_session_shows_reset_countdown():
     rows = account_rows()
     rows[1].limits[0] = m.Limit("session", "Session · 5h window", 94.0, dt(NOW + 45 * 60))
@@ -503,6 +642,198 @@ def test_render_includes_accounts_section():
     c.print(m.render(state, c))
     text = c.export_text()
     assert "Accounts" in text and "spare" in text
+
+
+# ------------------------------------------------------------- auto-rotate
+
+
+def _limits(**kinds) -> list:
+    when = {"session": NOW + 3600, "weekly_all": NOW + 86400, "weekly_scoped": NOW + 86400}
+    return [m.Limit(k, k, p, dt(when.get(k, NOW + 3600))) for k, p in kinds.items()]
+
+
+def _live_state(live_max: float, fetched: float | None = NOW) -> m.State:
+    s = m.State()
+    s.limits = _limits(session=live_max)
+    s.fetched_at = dt(fetched) if fetched else None
+    return s
+
+
+def test_max_pct():
+    assert m._max_pct(_limits(session=10.0, weekly_all=55.0)) == 55.0
+    assert m._max_pct([m.Limit("s", "s", None, None)]) is None
+    assert m._max_pct([]) is None
+
+
+def test_render_accounts_autorotate_indicator():
+    rows = account_rows()
+    on = m.render_accounts(rows, [], 72, dt(NOW), autorotate=True)
+    off = m.render_accounts(rows, [], 72, dt(NOW), autorotate=False)
+    assert "auto-rotate" in on.renderables[0].plain
+    assert "auto-rotate" not in off.renderables[0].plain
+    narrow = m.render_accounts(rows, [], 40, dt(NOW), autorotate=True)
+    assert "auto-rotate" not in narrow.renderables[0].plain  # dropped, not overflowed
+
+
+def test_render_accounts_narrow_width_never_overflows():
+    rows = [
+        m.AccountRow("empractica-jamie", "e@x.io", "uuid-b", is_live=True),
+        m.AccountRow("mosaic", "m@x.io", "uuid-c",
+                     limits=[m.Limit("session", "Session · 5h window", 100.0, dt(NOW + 3 * 3600)),
+                             m.Limit("weekly_all", "Week · all models", 21.0, dt(NOW + 86400))],
+                     credits=m.Credits(enabled=True, used=5.0, limit=20.0),
+                     fetched_at=NOW - 60),
+    ]
+    live = [m.Limit("session", "Session · 5h window", 100.0, dt(NOW + 3 * 3600 + 57 * 60))]
+    for width in (30, 34, 40, 46, 52):
+        g = m.render_accounts(rows, live, width, dt(NOW), autorotate=True)
+        for line in g.renderables:
+            assert line.cell_len <= width, (width, repr(line.plain))
+
+
+def _autorotate_env(monkeypatch, live_pct=100.0, marker=None):
+    """Stub the file/keychain touchpoints an autorotate pass crosses."""
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: marker)
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok-live", "max"))
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot",
+                        lambda name: {"claudeAiOauth": {"accessToken": f"tok-{name}"}})
+    monkeypatch.setattr(m, "fetch_usage",
+                        lambda tok: {"limits": [{"kind": "session",
+                                                 "percent": live_pct if tok == "tok-live" else 20.0}]})
+
+
+def test_autorotate_skips_when_live_has_headroom(monkeypatch):
+    _autorotate_env(monkeypatch)
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("live is fine"))
+    state = _live_state(60.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=10.0), fetched_at=NOW)]
+    assert m.autorotate_once(state, rows, {}, 0.0) == 0.0
+
+
+def test_autorotate_switches_to_login_with_headroom(monkeypatch):
+    _autorotate_env(monkeypatch)
+    switched = {}
+    monkeypatch.setattr(m.accounts, "cmd_switch",
+                        lambda name, quiet=False: switched.update(name=name, quiet=quiet))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=20.0), fetched_at=NOW)]
+    state.api_limits = _limits(session=100.0)  # old login's numbers, must be dropped
+    state.credits = m.Credits(enabled=True, used=141.79)
+    next_poll = {"spare": 999.0, "other": 555.0}
+    ts = m.autorotate_once(state, rows, next_poll, 0.0)
+    assert switched == {"name": "spare", "quiet": True}
+    assert ts > 0.0
+    assert next_poll == {"other": 555.0}  # new live leaves the rotation; backoffs survive
+    assert "auto-rotated to spare" in state.autorotate_note
+    assert state.api_limits == [] and state.fetched_at is None  # stale live data cleared
+    assert not state.credits.enabled       # the old login's credit spend cleared too
+    assert state.login_epoch == 1          # in-flight polls of the old login get dropped
+    assert [r.is_live for r in rows] == [False, True]  # panel flips without waiting a tick
+
+
+def test_autorotate_live_confirm_vetoes_stale_100(monkeypatch):
+    # state says 100% but the confirming poll shows the window just reset —
+    # no switch, and the fresh truth replaces the stale panel data
+    _autorotate_env(monkeypatch, live_pct=20.0)
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("live just reset"))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=5.0), fetched_at=NOW)]
+    assert m.autorotate_once(state, rows, {}, 0.0) == 0.0
+    assert [l.percent for l in state.api_limits] == [20.0]
+
+
+def test_autorotate_rate_limited_confirm_falls_back_to_state(monkeypatch):
+    # a 429 on the confirm poll doesn't dispute the recency-guarded 100% — rotate anyway
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok-live", "max"))
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot",
+                        lambda name: {"claudeAiOauth": {"accessToken": f"tok-{name}"}})
+
+    def fetch(tok):
+        if tok == "tok-live":
+            raise m.RateLimited(60)
+        return {"limits": [{"kind": "session", "percent": 20.0}]}
+
+    monkeypatch.setattr(m, "fetch_usage", fetch)
+    switched = {}
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda name, quiet=False: switched.update(name=name))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=20.0), fetched_at=NOW)]
+    assert m.autorotate_once(state, rows, {}, 0.0) > 0.0
+    assert switched["name"] == "spare"
+
+
+def test_autorotate_waits_while_switch_marker_pending(monkeypatch):
+    _autorotate_env(monkeypatch, marker={"target": "spare"})
+    monkeypatch.setattr(m, "fetch_usage", lambda tok: pytest.fail("must not poll mid-heal"))
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("half-applied switch pending"))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=5.0), fetched_at=NOW)]
+    assert m.autorotate_once(state, rows, {}, 0.0) == 0.0
+
+
+def test_autorotate_respects_cooldown(monkeypatch):
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("still cooling down"))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=5.0), fetched_at=NOW)]
+    recent = time.time()
+    assert m.autorotate_once(state, rows, {}, recent) == recent
+
+
+def test_autorotate_ignores_stale_live_data(monkeypatch):
+    # cooldown has passed, but the live numbers were fetched BEFORE the last
+    # switch — a leftover 100% must not trigger an immediate re-switch
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("stale 100% must not switch"))
+    last = time.time() - (m.AUTOROTATE_COOLDOWN + 5)
+    state = _live_state(100.0, fetched=last - 10)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=5.0), fetched_at=NOW)]
+    assert m.autorotate_once(state, rows, {}, last) == last
+
+
+def test_autorotate_all_logins_maxed_sets_note_and_paces(monkeypatch):
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok-live", "max"))
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot",
+                        lambda name: {"claudeAiOauth": {"accessToken": f"tok-{name}"}})
+    monkeypatch.setattr(m, "fetch_usage",
+                        lambda tok: {"limits": [{"kind": "session", "percent": 100.0}]})
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda *a, **k: pytest.fail("no login has room"))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("spare", "s", "b", limits=_limits(session=100.0), fetched_at=NOW)]
+    ts = m.autorotate_once(state, rows, {}, 0.0)
+    assert ts > 0.0  # a failed full pass advances the clock: no 20s confirm-poll storm
+    assert "all logins at their limit" in state.autorotate_note
+    # ...and the very next tick is inside the cooldown, so nothing is re-polled
+    monkeypatch.setattr(m, "fetch_usage", lambda tok: pytest.fail("pass must be paced"))
+    assert m.autorotate_once(state, rows, {}, ts) == ts
+
+
+def test_autorotate_picks_most_headroom(monkeypatch):
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok-live", "max"))
+    monkeypatch.setattr(m.accounts, "ensure_fresh_slot",
+                        lambda name: {"claudeAiOauth": {"accessToken": f"tok-{name}"}})
+    polls = {"tok-live": {"limits": [{"kind": "session", "percent": 100.0}]},
+             "tok-b": {"limits": [{"kind": "session", "percent": 80.0}]},
+             "tok-c": {"limits": [{"kind": "session", "percent": 30.0}]}}
+    monkeypatch.setattr(m, "fetch_usage", lambda tok: polls[tok])
+    switched = {}
+    monkeypatch.setattr(m.accounts, "cmd_switch", lambda name, quiet=False: switched.update(name=name))
+    state = _live_state(100.0)
+    rows = [m.AccountRow("live", "l", "a", is_live=True),
+            m.AccountRow("b", "b", "b", limits=_limits(session=79.0), fetched_at=NOW),
+            m.AccountRow("c", "c", "c", limits=_limits(session=29.0), fetched_at=NOW)]
+    m.autorotate_once(state, rows, {}, 0.0)
+    assert switched["name"] == "c"  # lowest known usage tried first, confirmed with headroom
 
 
 def test_accounts_loop_polls_only_non_live(monkeypatch):
@@ -589,7 +920,9 @@ def test_parse_dt_rejects_nonfinite_and_garbage_epoch():
 
 
 def test_parse_credits_garbage_types_do_not_crash_render():
-    payload = {"extra_usage": {"is_enabled": True, "used_credits": "12.5", "monthly_limit": "fifty"}}
+    # "1250" parses (minor units -> $12.50); "fifty" is unparseable -> no limit
+    payload = {"extra_usage": {"is_enabled": True, "used_credits": "1250", "monthly_limit": "fifty",
+                               "decimal_places": 2}}
     credits = m.parse_credits(payload)
     assert credits.used == 12.5 and credits.limit is None
     state = full_state()
@@ -715,3 +1048,267 @@ def test_fetch_usage_error_dispatch(monkeypatch):
     monkeypatch.setattr(m.urllib.request, "urlopen", auth_body)
     with pytest.raises(m.AuthError):
         m.fetch_usage("tok")
+
+
+# ------------------------------------------------------------------ credits
+
+# The real /api/oauth/usage payload the user is on: credits enabled and funded,
+# all plan windows maxed, org meters the cap centrally so every $ cap is null.
+CREDITS_ACTIVE_PAYLOAD = {
+    "extra_usage": {"is_enabled": True, "monthly_limit": None, "used_credits": 14179.0,
+                    "utilization": None, "currency": "USD", "decimal_places": 2},
+    "spend": {"enabled": True, "used": {"amount_minor": 14179, "currency": "USD", "exponent": 2},
+              "limit": None, "cap": None, "balance": None, "percent": 0},
+    "limits": [
+        {"kind": "session", "percent": 100.0, "resets_at": "2026-07-03T21:00:00+00:00", "is_active": True},
+        {"kind": "weekly_all", "percent": 100.0, "resets_at": "2026-07-08T00:00:00+00:00", "is_active": False},
+        {"kind": "weekly_scoped", "percent": 100.0, "resets_at": "2026-07-08T00:00:00+00:00",
+         "scope": {"model": {"display_name": "Opus"}}, "is_active": False},
+    ],
+}
+
+
+def test_money_to_major_shapes():
+    assert m.money_to_major({"amount_minor": 14179, "exponent": 2}) == 141.79
+    assert m.money_to_major({"amount_minor": 500, "exponent": 3}) == 0.5
+    assert m.money_to_major(1250, exponent_default=2) == 12.5          # bare minor-unit number
+    assert m.money_to_major(None) is None
+    assert m.money_to_major({"amount_minor": None}) is None
+    assert m.money_to_major("nope") is None
+    assert m.money_to_major({"amount_minor": 100, "exponent": "bad"}) == 1.0  # bad exponent -> default 2
+
+
+def test_fmt_money():
+    assert m.fmt_money(None) == "—"
+    assert m.fmt_money(141.79) == "$141.79"
+    assert m.fmt_money(1234.5, "USD") == "$1,234.50"
+    assert m.fmt_money(9.99, "EUR") == "€9.99"
+    assert m.fmt_money(5.0, "CHF") == "5.00 CHF"  # unknown symbol -> code suffix
+
+
+def test_credits_available_property():
+    assert m.Credits(enabled=True, used=10.0).available is None            # uncapped
+    assert m.Credits(enabled=True, used=10.0, limit=50.0).available == 40.0
+    assert m.Credits(enabled=True, used=60.0, limit=50.0).available == 0.0  # never negative
+    assert m.Credits(enabled=True, used=10.0, balance=25.0).available == 25.0
+    assert m.Credits(enabled=True, used=10.0, balance=-3.0).available == 0.0  # overdrawn, not "-$3 left"
+    # balance wins over a cap when both are present
+    assert m.Credits(enabled=True, used=10.0, limit=50.0, balance=5.0).available == 5.0
+
+
+def test_credits_active_detection():
+    credits = m.parse_credits(CREDITS_ACTIVE_PAYLOAD)
+    limits = m.parse_limits(CREDITS_ACTIVE_PAYLOAD)
+    assert m.credits_active(limits, credits) is True                       # enabled + is_active at 100%
+    assert m.credits_active([], credits) is False                          # no limit data yet
+    assert m.credits_active(limits, m.Credits(enabled=False)) is False     # credits off
+    # is_active window below the threshold -> not spilling yet
+    calm = [m.Limit("session", "s", 40.0, dt(NOW + 3600), is_active=True)]
+    assert m.credits_active(calm, credits) is False
+    # no is_active flag anywhere -> require session and weekly evidence, all maxed
+    session_only = [m.Limit("session", "s", 100.0, dt(NOW + 3600), is_active=False)]
+    assert m.credits_active(session_only, credits) is False
+    partial = [m.Limit("session", "s", 100.0, dt(NOW + 3600), is_active=False),
+               m.Limit("weekly_all", "w", 40.0, dt(NOW + 86400), is_active=False)]
+    assert m.credits_active(partial, credits) is False
+    maxed = [m.Limit("session", "s", 100.0, dt(NOW + 3600), is_active=False),
+             m.Limit("weekly_all", "w", 100.0, dt(NOW + 86400), is_active=False)]
+    assert m.credits_active(maxed, credits) is True
+
+
+def test_credit_binding_limit_prefers_future_reset():
+    past = m.Limit("session", "s", 100.0, dt(NOW - 600), is_active=False)
+    future = m.Limit("weekly_all", "w", 100.0, dt(NOW + 86400), is_active=False)
+    binding, api_bound = m.credit_binding_limit([past, future], dt(NOW))
+    assert binding is future and api_bound is False  # a live deadline beats a stale "now"
+    binding, _ = m.credit_binding_limit([past], dt(NOW))
+    assert binding is past  # nothing in the future -> still better than no countdown
+
+
+def test_credits_active_requires_used_known():
+    # enabled but `used` never parsed (partial payload) -> can't be "drawing"
+    limits = m.parse_limits(CREDITS_ACTIVE_PAYLOAD)
+    assert m.credits_active(limits, m.Credits(enabled=True, used=None)) is False
+
+
+def test_track_credit_today_baseline_and_delta():
+    state = m.State()
+    state.credits = m.Credits(enabled=True, used=129.32)
+    m._track_credit_today(state, NOW)
+    assert state.credit_today == 0.0                    # first sample sets the baseline
+    state.credits = m.Credits(enabled=True, used=141.79)
+    m._track_credit_today(state, NOW + 600)
+    assert round(state.credit_today, 2) == 12.47        # delta from baseline
+
+
+def test_track_credit_today_day_rollover_rebaselines():
+    state = m.State()
+    state.credits = m.Credits(enabled=True, used=100.0)
+    m._track_credit_today(state, NOW)
+    state.credits = m.Credits(enabled=True, used=150.0)
+    m._track_credit_today(state, NOW + 2 * 86400)       # two days later
+    assert state.credit_today == 0.0                    # new day -> baseline resets to 150
+
+
+def test_track_credit_today_counter_reset_clamps():
+    state = m.State()
+    state.credits = m.Credits(enabled=True, used=50.0)
+    m._track_credit_today(state, NOW)
+    state.credits = m.Credits(enabled=True, used=3.0)   # billing period reset mid-day
+    m._track_credit_today(state, NOW + 600)
+    assert state.credit_today == 0.0                    # rebaselines, never negative
+
+
+def test_track_credit_today_ignores_disabled():
+    state = m.State()
+    state.credits = m.Credits(enabled=False, used=None)
+    m._track_credit_today(state, NOW)
+    assert state.credit_today is None and state.credit_baseline is None
+
+
+def test_track_credit_today_login_change_rebaselines():
+    state = m.State()
+    state.credits_owner = "acct-a"
+    state.credits = m.Credits(enabled=True, used=50.0)
+    m._track_credit_today(state, NOW)
+    state.credits = m.Credits(enabled=True, used=62.0)
+    m._track_credit_today(state, NOW + 300)
+    assert round(state.credit_today, 2) == 12.0
+    # switch to a login whose cumulative counter is HIGHER — the jump must not
+    # count as today's spend (used is per-account, deltas across logins are noise)
+    state.credits_owner = "acct-b"
+    state.credits = m.Credits(enabled=True, used=141.79)
+    m._track_credit_today(state, NOW + 600)
+    assert state.credit_today == 0.0 and state.credit_account == "acct-b"
+
+
+def test_credit_baseline_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "CREDITS_FILE", tmp_path / "credits.json")
+    state = m.State()
+    state.credit_day = datetime.now().strftime("%Y-%m-%d")
+    state.credit_baseline = 129.32
+    state.credit_account = "acct-a"
+    m.save_credit_baseline(state)
+    loaded = m.State()
+    m.load_credit_baseline(loaded)
+    assert loaded.credit_day == state.credit_day and loaded.credit_baseline == 129.32
+    assert loaded.credit_account == "acct-a"  # restart under another login discards it
+
+
+def test_credit_baseline_stale_day_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "credits.json"
+    monkeypatch.setattr(m, "CREDITS_FILE", path)
+    path.write_text(json.dumps({"day": "2000-01-01", "baseline": 42.0}))  # yesteryear
+    loaded = m.State()
+    m.load_credit_baseline(loaded)
+    assert loaded.credit_baseline is None  # a stale baseline would make "today" span days
+
+
+def test_credit_baseline_nothing_to_save(tmp_path, monkeypatch):
+    path = tmp_path / "credits.json"
+    monkeypatch.setattr(m, "CREDITS_FILE", path)
+    m.save_credit_baseline(m.State())  # no baseline observed yet
+    assert not path.exists()
+
+
+def _credits_state() -> m.State:
+    state = m.State()
+    payload = json.loads(json.dumps(CREDITS_ACTIVE_PAYLOAD))
+    payload["limits"][0]["resets_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    state.api_limits = m.parse_limits(payload)
+    state.limits = m.merge_limits(state.api_limits, None)
+    state.credits = m.parse_credits(payload)
+    state.credit_day = datetime.now().strftime("%Y-%m-%d")
+    state.credit_baseline = 129.32
+    m._track_credit_today(state, time.time())
+    state.subscription = "max"
+    state.status = "live"
+    state.status_style = "green"
+    state.fetched_at = datetime.now(timezone.utc)
+    return state
+
+
+def test_render_big_dollar_replaces_bars():
+    state = _credits_state()
+    c = make_console()
+    c.print(m.render(state, c))
+    text = c.export_text()
+    assert "Drawing on usage credits" in text
+    assert "$12.47" in text and "spent today" in text
+    assert "$141.79 used this month" in text
+    assert "until reset" not in text          # the three per-limit bars are gone
+    assert "resets in" in text                # ...but the reset countdown stays
+
+
+def test_render_credit_spend_without_active_uses_neutral_reset_label():
+    state = _credits_state()
+    for lim in state.limits:
+        lim.is_active = False
+    c = make_console()
+    c.print(m.render(state, c))
+    text = c.export_text()
+    assert "Next plan reset in" in text
+    assert "Session · 5h window resets in" not in text
+
+
+def test_render_big_dollar_zero_when_no_spend_tracked_yet():
+    state = _credits_state()
+    state.credit_today = None                 # no baseline established yet
+    c = make_console()
+    c.print(m.render(state, c))
+    text = c.export_text()
+    assert "$0.00" in text and "spent today" in text
+
+
+def test_render_small_credits_line_fixed_dollars():
+    # plan has headroom -> normal bars + the small credits line, in real dollars
+    state = m.State()
+    lims = m.parse_limits({"limits": [
+        {"kind": "session", "percent": 30.0, "resets_at": "2026-07-03T21:00:00+00:00", "is_active": True}]})
+    state.limits = lims
+    state.api_limits = lims
+    state.credits = m.parse_credits(CREDITS_ACTIVE_PAYLOAD)  # used $141.79
+    state.subscription = "max"
+    state.status = "live"
+    state.status_style = "green"
+    state.fetched_at = datetime.now(timezone.utc)
+    c = make_console()
+    c.print(m.render(state, c))
+    text = c.export_text()
+    assert "Extra usage credits" in text
+    assert "$141.79 used" in text
+    assert "$14179" not in text               # regression guard: the old 100x bug
+
+
+def test_render_accounts_credit_cell_on_non_live():
+    live = [m.Limit("session", "Session · 5h window", 100.0, dt(NOW + 3600))]
+    capped = m.Credits(enabled=True, used=5.0, limit=20.0, currency="USD")
+    uncapped = m.Credits(enabled=True, used=141.79, currency="USD")
+    rows = [
+        m.AccountRow("james", "j@x.io", "uuid-a", is_live=True, credits=uncapped),
+        m.AccountRow("work", "w@x.io", "uuid-b",
+                     limits=[m.Limit("session", "Session · 5h window", 42.0, dt(NOW + 3600))],
+                     credits=capped, fetched_at=NOW - 60),
+        m.AccountRow("solo", "s@x.io", "uuid-c",
+                     limits=[m.Limit("session", "Session · 5h window", 10.0, dt(NOW + 3600))],
+                     credits=uncapped, fetched_at=NOW - 60),
+    ]
+    g = m.render_accounts(rows, live, 72, dt(NOW))
+    live_line = g.renderables[1].plain
+    work_line = g.renderables[2].plain
+    solo_line = g.renderables[3].plain
+    assert "left" not in live_line and "used" not in live_line   # live row shows no credit cell
+    assert "$15.00 left" in work_line                            # cap 20 - used 5
+    assert "$141.79 used" in solo_line                           # uncapped -> falls back to used
+
+
+def test_render_accounts_credit_cell_only_for_enabled():
+    live = [m.Limit("session", "s", 50.0, dt(NOW + 3600))]
+    rows = [
+        m.AccountRow("james", "j@x.io", "uuid-a", is_live=True),
+        m.AccountRow("work", "w@x.io", "uuid-b",
+                     limits=[m.Limit("session", "s", 42.0, dt(NOW + 3600))],
+                     credits=m.Credits(enabled=False), fetched_at=NOW - 60),
+    ]
+    g = m.render_accounts(rows, live, 72, dt(NOW))
+    assert "used" not in g.renderables[2].plain and "left" not in g.renderables[2].plain

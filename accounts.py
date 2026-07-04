@@ -622,14 +622,15 @@ def cmd_list() -> None:
         print(f"{marker} {a.name:<14} {a.email:<28} {sub:<8} {state}")
 
 
-def cmd_switch(name: str) -> None:
+def cmd_switch(name: str, quiet: bool = False) -> None:
     accounts = load_index()
     target = next((a for a in accounts if a.name == name), None)
     if target is None:
         known = ", ".join(a.name for a in accounts) or "none saved"
         raise AccountError(f"no account named {name!r} (known: {known})")
     if target.account_uuid and target.account_uuid == active_account_uuid():
-        print(f"{name!r} is already the active login")
+        if not quiet:
+            print(f"{name!r} is already the active login")
         return
     sync_back_live(accounts)
     slot = ensure_fresh_slot(name)
@@ -642,8 +643,13 @@ def cmd_switch(name: str) -> None:
     write_claude_json_identity(slot.get("identity") or {})
     clear_marker()
     clear_usage_feed()
-    print(f"switched to {name!r} ({target.email})")
-    print("new `claude` sessions use this login; running sessions keep the old one until restarted")
+    if not quiet:
+        print(f"switched to {name!r} ({target.email})")
+        # New `claude` sessions use this login. Already-running sessions pick it
+        # up on their next request too: Claude Code re-reads the credential
+        # store when a request retries (e.g. after a rate-limit block), so a
+        # switch made while they're blocked lets them resume on this account.
+        print("active for new sessions; blocked sessions resume on this login at their next retry")
 
 
 def clear_usage_feed() -> None:
