@@ -407,7 +407,8 @@ class State:
     credit_baseline: float | None = None   # `used` at the first sample seen that day
     credit_account: str = ""               # login uuid the baseline was measured on
     credits_owner: str = ""                # login uuid the current `credits` came from
-    login_epoch: int = 0                   # bumped by auto-rotate; stamps poll provenance
+    login_epoch: int = 0                   # bumped on any login switch; stamps poll provenance
+    live_uuid: str = ""                    # login the panel's api_limits/credits describe
     history: dict[str, list[tuple[float, float]]] = field(default_factory=dict)  # kind -> [(epoch, pct)]
     accounts: list[AccountRow] = field(default_factory=list)
     accounts_warning: str = ""
@@ -419,6 +420,8 @@ class State:
     status_style: str = DIM
     retry_at: float | None = None  # epoch of the next poll attempt while backing off
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # set to cut the poll thread's sleep short (login switch → re-poll now)
+    poll_wake: threading.Event = field(default_factory=threading.Event)
 
 
 # ------------------------------------------------------------------ feed/merge
@@ -595,21 +598,28 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
         try:
             with state.lock:
                 epoch = state.login_epoch
+            # whose counters these are — read BEFORE the token, so a switch
+            # landing between the two reads shows up as an owner change below
+            owner = accounts.active_account_uuid()
             token, sub = read_access_token()
-            owner = accounts.active_account_uuid()  # whose counters these are
             payload = fetch_usage(token)
             api_limits = parse_limits(payload)
             credits = parse_credits(payload)
             feed_fresh = False
+            owner_now = accounts.active_account_uuid()
             with state.lock:
-                # An auto-rotate that landed while this request was in flight
-                # means the response describes the OLD login — writing it back
-                # would resurrect a stale 100% that just got cleared
-                switched_mid_poll = state.login_epoch != epoch
+                # A login switch that landed while this request was in flight
+                # (auto-rotate bumps the epoch; a claude-account switch or
+                # manual /login moves the uuid) means the response describes
+                # the OLD login — writing it back would show one account's
+                # numbers under another's name
+                switched_mid_poll = state.login_epoch != epoch or owner_now != owner
                 if not switched_mid_poll:
                     state.api_limits = api_limits
                     state.credits = credits
                     state.credits_owner = owner
+                    if owner:
+                        state.live_uuid = owner
                     state.subscription = sub
                     state.fetched_at = datetime.now(timezone.utc)
                     state.status = "live"
@@ -655,7 +665,8 @@ def poll_loop(state: State, interval: int, stop: threading.Event, notify: bool =
                 state.status = f"error: {exc}"
                 state.status_style = "red"
                 state.retry_at = time.time() + delay
-        stop.wait(delay)
+        if state.poll_wake.wait(delay):
+            state.poll_wake.clear()  # kicked: a login switch wants an immediate re-poll
 
 
 def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None:
@@ -752,11 +763,13 @@ def autorotate_once(state: State, rows: list[AccountRow], next_poll: dict[str, f
             for r in rows:
                 r.is_live = r.name == cand.name
             state.login_epoch += 1     # in-flight polls of the old login must be dropped
+            state.live_uuid = cand.account_uuid  # accounts_loop must not re-clear this switch
             state.api_limits = []      # the old login's API numbers no longer apply
             state.credits = Credits()  # ...nor its credit spend, until the next poll
             state.fetched_at = None    # force a fresh poll under the new login
             state.merged_prev = None   # don't emit cross-login "reset" events
             state.autorotate_note = f"⟳ {time.strftime('%H:%M')} auto-rotated to {cand.name} — previous login hit 100%"
+        state.poll_wake.set()  # fill the panel from the new login now, not next cycle
         return time.time()
     with state.lock:
         state.autorotate_note = f"⚠ {time.strftime('%H:%M')} all logins at their limit — waiting for a reset"
@@ -777,8 +790,33 @@ def accounts_loop(state: State, stop: threading.Event, autorotate: bool = False)
         try:  # a bad index file or store hiccup must never kill this thread
             index = accounts.load_index()
             live_uuid = accounts.active_account_uuid()
+            switched = False
             with state.lock:
+                if live_uuid and state.live_uuid and live_uuid != state.live_uuid:
+                    # The login changed outside this process (claude-account
+                    # switch, or a manual /login). Every number on the panel
+                    # still describes the OLD login — drop it all and show
+                    # placeholders until a poll of the new login lands, rather
+                    # than another account's data under this login's name.
+                    switched = True
+                    state.login_epoch += 1        # drop in-flight polls of the old login
+                    state.api_limits = []
+                    state.credits = Credits()
+                    state.credit_today = None
+                    state.subscription = ""
+                    state.fetched_at = None
+                    state.merged_prev = None      # no cross-login "reset" notifications
+                    state.feed = None             # feed snapshots described the old login
+                    state.feed_as_of = None
+                    state.status = "login switched — refreshing…"
+                    state.status_style = DIM
+                    state.retry_at = None
+                if live_uuid:
+                    state.live_uuid = live_uuid
                 prev = {r.name: r for r in state.accounts}
+            if switched:
+                recompute(state)                  # rebuild the merged view (now empty)
+                state.poll_wake.set()             # fetch the new login's numbers now
             rows: list[AccountRow] = []
             for i, acct in enumerate(index):
                 old = prev.get(acct.name)
@@ -1247,7 +1285,9 @@ def _account_limit_plain(limit: Limit | None, now: datetime) -> str:
 def _account_limit_cell(limit: Limit | None, now: datetime, width: int) -> Text:
     cell = Text()
     if limit is None or limit.percent is None:
-        cell.append(" " * width)
+        # no data is not zero — and never another login's number (a freshly
+        # switched-to live row has nothing yet): show a placeholder
+        cell.append(_fit_cells("—", width), style=DIM)
         return cell
 
     pct_txt = f"{limit.percent:.0f}%"
@@ -1354,8 +1394,8 @@ def render_accounts(rows: list[AccountRow], live_limits: list[Limit], width: int
         if not columns and credit_txt:
             left.append(_fit_cells(credit_txt, max(10, width - prefix_width - status_width - 2)), style=credit_style)
             shown_any = True
-        if not shown_any and not row.note:
-            left.append("waiting…", style=DIM)
+        if not columns and not shown_any and not row.note:
+            left.append("waiting…", style=DIM)  # with columns, empty cells show "—" instead
         right = Text()
         status_text, status_style = statuses[row.name]
         right.append(status_text, style=status_style)
@@ -1574,6 +1614,7 @@ def main() -> None:
 
     def bye(*_):
         stop.set()
+        state.poll_wake.set()  # the poll thread sleeps on this event
         raise SystemExit(0)
 
     signal.signal(signal.SIGINT, bye)

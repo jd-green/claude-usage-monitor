@@ -435,20 +435,20 @@ def test_poll_loop_success_path(monkeypatch):
 
     state = m.State()
     stop = threading.Event()
-    orig_wait = stop.wait
 
-    def wait(t=None):
+    def wait(t=None):  # poll_loop sleeps on poll_wake so a switch can cut it short
         if calls["n"] >= 3:
             stop.set()
             return True
-        return orig_wait(0)
+        return False
 
-    stop.wait = wait
+    state.poll_wake.wait = wait
     m.poll_loop(state, 30, stop, notify=True)
 
     assert state.status == "live" and state.retry_at is None
     assert state.subscription == "max"
     assert state.credits_owner == "uuid-live"
+    assert state.live_uuid == "uuid-live"
     assert [p for _, p in state.history["session"]] == [78.0, 96.0, 3.0]
     assert any("at 96%" in n for n in notes)
     assert any("reset — now 3%" in n for n in notes)
@@ -460,17 +460,17 @@ def test_poll_loop_rate_limited_sets_retry_deadline(monkeypatch):
 
     monkeypatch.setattr(m, "fetch_usage", fake_fetch)
     monkeypatch.setattr(m, "read_access_token", lambda: ("tok", "max"))
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-live")
     state = m.State()
     stop = threading.Event()
     snapshots = []
-    orig_wait = stop.wait
 
     def wait(t=None):
         snapshots.append((state.status, state.retry_at))
         stop.set()
         return True
 
-    stop.wait = wait
+    state.poll_wake.wait = wait
     m.poll_loop(state, 30, stop, notify=False)
     status, retry_at = snapshots[0]
     assert status.startswith("rate limited")
@@ -495,10 +495,33 @@ def test_poll_loop_discards_result_when_login_switches_mid_flight(monkeypatch):
         stop.set()
         return True
 
-    stop.wait = wait
+    state.poll_wake.wait = wait
     m.poll_loop(state, 30, stop, notify=False)
     # the response described the OLD login: nothing written, prompt re-poll
     assert state.api_limits == [] and state.status == "starting…"
+    assert waits[0] == 2
+
+
+def test_poll_loop_discards_result_when_owner_moves_mid_flight(monkeypatch):
+    # an external claude-account switch lands between the token read and the
+    # response: the epoch is unchanged, but the live uuid moved — the payload
+    # belongs to the old login and must not be written under the new one
+    uuids = iter(["uuid-a"])
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: next(uuids, "uuid-b"))
+    monkeypatch.setattr(m, "fetch_usage", lambda tok: json.loads(json.dumps(API_PAYLOAD)))
+    monkeypatch.setattr(m, "read_access_token", lambda: ("tok", "max"))
+    state = m.State()
+    stop = threading.Event()
+    waits = []
+
+    def wait(t=None):
+        waits.append(t)
+        stop.set()
+        return True
+
+    state.poll_wake.wait = wait
+    m.poll_loop(state, 30, stop, notify=False)
+    assert state.api_limits == [] and state.credits_owner == ""
     assert waits[0] == 2
 
 
@@ -622,6 +645,24 @@ def test_render_accounts_hidden_without_second_account():
     assert m.render_accounts([], [], 72, dt(NOW)) is None
     only_live = [m.AccountRow("james", "j@x.io", "uuid-a", is_live=True)]
     assert m.render_accounts(only_live, [], 72, dt(NOW)) is None
+
+
+def test_render_accounts_no_data_shows_dashes_not_other_accounts_numbers():
+    # right after a login switch the live row has no numbers of its own yet —
+    # placeholders, never blanks or a stale copy of another login's data
+    rows = [
+        m.AccountRow("mosaic", "m@x.io", "uuid-a", is_live=True),
+        m.AccountRow("spare", "s@x.io", "uuid-b",
+                     limits=[m.Limit("session", "Session · 5h window", 12.0, dt(NOW + 3600)),
+                             m.Limit("weekly_scoped", "Week · Fable", 41.0, dt(NOW + 86400))],
+                     fetched_at=NOW - 120),
+    ]
+    g = m.render_accounts(rows, [], 72, dt(NOW))  # live limits cleared by the switch
+    live_line = g.renderables[1].plain
+    assert "—" in live_line and "%" not in live_line
+    assert "waiting…" not in live_line
+    assert live_line.rstrip().endswith("live")
+    assert "12%" in g.renderables[2].plain  # the spare row's own poll still shows
 
 
 def test_render_accounts_note_and_waiting_states():
@@ -900,6 +941,60 @@ def test_accounts_loop_marks_auth_failures(monkeypatch):
     monkeypatch.setattr(m, "ACCOUNTS_TICK", 0)
     m.accounts_loop(state, stop)
     assert state.accounts[0].note == "needs /login"
+
+
+def _one_tick(stop: threading.Event):
+    def wait(t=None):
+        stop.set()
+        return True
+    return wait
+
+
+def test_accounts_loop_external_switch_clears_stale_panel(monkeypatch):
+    # `claude-account switch` run outside the monitor: every panel number still
+    # describes the OLD login and must be dropped, not shown under the new
+    # account's name (the "mosaic at fable 100% when really 38%" bug)
+    monkeypatch.setattr(m.accounts, "load_index", lambda: [])
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-b")
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    state = m.State()
+    state.live_uuid = "uuid-a"
+    state.api_limits = _limits(session=100.0, weekly_scoped=100.0)
+    state.limits = list(state.api_limits)
+    state.merged_prev = list(state.api_limits)
+    state.feed = {"session": (100.0, NOW + 3600)}
+    state.feed_as_of = NOW
+    state.credits = m.Credits(enabled=True, used=141.79)
+    state.credit_today = 10.83
+    state.subscription = "max"
+    state.fetched_at = dt(NOW)
+    stop = threading.Event()
+    stop.wait = _one_tick(stop)
+    m.accounts_loop(state, stop)
+    assert state.live_uuid == "uuid-b"
+    assert state.login_epoch == 1                # in-flight polls of the old login drop
+    assert state.api_limits == [] and state.limits == []
+    assert state.feed is None and state.feed_as_of is None
+    assert not state.credits.enabled and state.credit_today is None
+    assert state.subscription == "" and state.fetched_at is None
+    assert state.poll_wake.is_set()              # immediate re-poll requested
+    assert "login switched" in state.status
+
+
+def test_accounts_loop_first_sighting_sets_uuid_without_clearing(monkeypatch):
+    # startup (or an unreadable ~/.claude.json recovering): learning the live
+    # uuid for the first time is not a switch — keep the data already fetched
+    monkeypatch.setattr(m.accounts, "load_index", lambda: [])
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-a")
+    monkeypatch.setattr(m.accounts, "read_marker", lambda: None)
+    state = m.State()
+    state.api_limits = _limits(session=50.0)
+    stop = threading.Event()
+    stop.wait = _one_tick(stop)
+    m.accounts_loop(state, stop)
+    assert state.live_uuid == "uuid-a"
+    assert state.login_epoch == 0 and state.api_limits
+    assert not state.poll_wake.is_set()
 
 
 # --------------------------------------------------- review-fix regressions

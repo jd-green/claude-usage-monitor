@@ -209,8 +209,15 @@ budget on the usage endpoint, so this doesn't compete with the main poll),
 with stale tokens auto-refreshed. Columns align across rows and drop from the
 right when the pane is narrow; a session window at ≥90% shows its reset
 countdown inline, and non-live rows show credit headroom (`$X left` / `$X
-used`) when usage credits are enabled. Rows fall back to `rate limited` /
-`needs /login` / `waiting…` when data isn't available.
+used`) when usage credits are enabled. Cells with no data show `—`, and rows
+fall back to `rate limited` / `needs /login` / `waiting…` — missing numbers
+are never guessed.
+
+When the live login changes outside the monitor — a `claude-account switch`
+in another terminal, or a manual `/login` — the panel notices (within one
+20s tick), drops everything it knew about the previous login rather than
+showing it under the new account's name, renders `—` placeholders, and
+re-polls the new login immediately.
 
 ### Auto-rotate
 
