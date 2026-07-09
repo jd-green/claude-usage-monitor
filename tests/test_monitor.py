@@ -252,10 +252,18 @@ def test_detect_events_ignores_none_percent():
 # ------------------------------------------------------------------ feed
 
 
-def write_feed_file(feed_dir, name, rate_limits, age=0.0, captured_at=None):
+SOON = time.time() + 3600        # a live 5h window
+LATER = time.time() + 3 * 86400  # a live weekly window
+DEAD = time.time() - 600         # a window that has already reset
+
+
+def write_feed_file(feed_dir, name, rate_limits, age=0.0, captured_at=None, account_uuid=None):
     path = feed_dir / f"{name}.json"
-    path.write_text(json.dumps({"captured_at": captured_at or (time.time() - age),
-                                "session_id": name, "rate_limits": rate_limits}))
+    body = {"captured_at": captured_at or (time.time() - age),
+            "session_id": name, "rate_limits": rate_limits}
+    if account_uuid is not None:
+        body["account_uuid"] = account_uuid
+    path.write_text(json.dumps(body))
     if age:
         mtime = time.time() - age
         os.utime(path, (mtime, mtime))
@@ -265,25 +273,75 @@ def write_feed_file(feed_dir, name, rate_limits, age=0.0, captured_at=None):
 def test_read_feed_staleness_rule(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "FEED_DIR", tmp_path)
     # two fresh sessions on the current window, one fresh-but-stale-data, one old file
-    write_feed_file(tmp_path, "a", {"five_hour": {"used_percentage": 23, "resets_at": 2_000_000},
-                                    "seven_day": {"used_percentage": 24, "resets_at": 3_000_000}})
-    write_feed_file(tmp_path, "b", {"five_hour": {"used_percentage": 22, "resets_at": 2_000_000},
-                                    "seven_day": {"used_percentage": 11, "resets_at": 3_000_000}})
-    write_feed_file(tmp_path, "c", {"five_hour": {"used_percentage": 93, "resets_at": 1_900_000}})  # old window
-    write_feed_file(tmp_path, "d", {"five_hour": {"used_percentage": 99, "resets_at": 2_000_000}},
+    write_feed_file(tmp_path, "a", {"five_hour": {"used_percentage": 23, "resets_at": SOON},
+                                    "seven_day": {"used_percentage": 24, "resets_at": LATER}})
+    write_feed_file(tmp_path, "b", {"five_hour": {"used_percentage": 22, "resets_at": SOON},
+                                    "seven_day": {"used_percentage": 11, "resets_at": LATER}})
+    write_feed_file(tmp_path, "c", {"five_hour": {"used_percentage": 93, "resets_at": SOON - 1800}})  # old window
+    write_feed_file(tmp_path, "d", {"five_hour": {"used_percentage": 99, "resets_at": SOON}},
                     age=m.FEED_MAX_AGE + 30)  # too old a file: ignored entirely
     result = m.read_feed()
     assert result is not None
     feed, as_of = result
-    assert feed["session"] == (23.0, 2_000_000.0)      # newest window, max pct; 93 and 99 ignored
-    assert feed["weekly_all"] == (24.0, 3_000_000.0)   # stale 11% loses to 24%
+    assert feed["session"] == (23.0, SOON)      # newest window, max pct; 93 and 99 ignored
+    assert feed["weekly_all"] == (24.0, LATER)  # stale 11% loses to 24%
     assert as_of > 0
+
+
+def test_read_feed_drops_windows_that_already_reset(tmp_path, monkeypatch):
+    """A session idle for days re-renders its statusline with the numbers it last
+    saw, stamped captured_at=now. The window they describe is long gone."""
+    monkeypatch.setattr(m, "FEED_DIR", tmp_path)
+    write_feed_file(tmp_path, "idle", {"five_hour": {"used_percentage": 100, "resets_at": DEAD},
+                                       "seven_day": {"used_percentage": 44, "resets_at": DEAD}})
+    assert m.read_feed() is None
+    # ...but a dead 5h window doesn't discredit a still-live weekly one
+    write_feed_file(tmp_path, "idle", {"five_hour": {"used_percentage": 100, "resets_at": DEAD},
+                                       "seven_day": {"used_percentage": 44, "resets_at": LATER}})
+    feed, _ = m.read_feed()
+    assert "session" not in feed and feed["weekly_all"] == (44.0, LATER)
+
+
+def test_read_feed_scopes_to_the_live_login(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FEED_DIR", tmp_path)
+    write_feed_file(tmp_path, "mine", {"five_hour": {"used_percentage": 30, "resets_at": SOON}},
+                    account_uuid="uuid-a")
+    write_feed_file(tmp_path, "theirs", {"five_hour": {"used_percentage": 99, "resets_at": SOON + 7200}},
+                    account_uuid="uuid-b")
+    feed, _ = m.read_feed("uuid-a")
+    assert feed["session"] == (30.0, SOON)          # uuid-b's later window never considered
+    # an unstamped file is untrusted once we know which login is live
+    write_feed_file(tmp_path, "legacy", {"five_hour": {"used_percentage": 88, "resets_at": SOON + 7200}})
+    feed, _ = m.read_feed("uuid-a")
+    assert feed["session"] == (30.0, SOON)
+    # ...but with no live login known, everything counts (startup, before the first poll)
+    feed, _ = m.read_feed()
+    assert feed["session"][0] == 99.0
+
+
+def test_read_feed_drops_entries_from_another_weekly_anchor(tmp_path, monkeypatch):
+    """The regression: a session predating a /login still reports the OLD account's
+    windows, and the dispatcher stamps it with the NEW account's uuid. The weekly
+    reset is a per-account anchor, so it gives the entry away."""
+    monkeypatch.setattr(m, "FEED_DIR", tmp_path)
+    write_feed_file(tmp_path, "stale-login",
+                    {"five_hour": {"used_percentage": 96, "resets_at": SOON},
+                     "seven_day": {"used_percentage": 12, "resets_at": LATER + 5 * 86400}},
+                    account_uuid="uuid-a")
+    write_feed_file(tmp_path, "current",
+                    {"five_hour": {"used_percentage": 41, "resets_at": SOON},
+                     "seven_day": {"used_percentage": 100, "resets_at": LATER}},
+                    account_uuid="uuid-a")
+    feed, _ = m.read_feed("uuid-a", weekly_reset=LATER)
+    assert feed["weekly_all"] == (100.0, LATER)  # not the other account's 12%
+    assert feed["session"] == (41.0, SOON)       # and its 5h reading is discarded wholesale
 
 
 def test_read_feed_garbage_tolerant(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "FEED_DIR", tmp_path)
     (tmp_path / "bad.json").write_text("{not json")
     (tmp_path / "null.json").write_text(json.dumps({"session_id": "x", "rate_limits": None}))
+    (tmp_path / "list.json").write_text(json.dumps([1, 2, 3]))
     assert m.read_feed() is None
     monkeypatch.setattr(m, "FEED_DIR", tmp_path / "does-not-exist")
     assert m.read_feed() is None
@@ -292,14 +350,14 @@ def test_read_feed_garbage_tolerant(tmp_path, monkeypatch):
 def test_read_feed_uses_captured_at_for_freshness(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "FEED_DIR", tmp_path)
     write_feed_file(tmp_path, "old-capture",
-                    {"five_hour": {"used_percentage": 99, "resets_at": 2_000_000}},
+                    {"five_hour": {"used_percentage": 99, "resets_at": SOON}},
                     captured_at=time.time() - m.FEED_MAX_AGE - 30)
     write_feed_file(tmp_path, "fresh-capture",
-                    {"five_hour": {"used_percentage": 21, "resets_at": 2_000_000}})
+                    {"five_hour": {"used_percentage": 21, "resets_at": SOON}})
     result = m.read_feed()
     assert result is not None
     feed, _ = result
-    assert feed["session"] == (21.0, 2_000_000.0)
+    assert feed["session"] == (21.0, SOON)
 
 
 def test_merge_limits_rules():
@@ -325,6 +383,43 @@ def test_merge_limits_rules():
     assert out[0].kind == "session" and out[0].label == "Session · 5h window"
     # merge must not mutate the API snapshot
     assert api[0].percent == 45.0
+
+
+def test_merge_limits_never_adopts_a_foreign_window():
+    """The 100%-week-reads-12% regression: the API says the weekly window is
+    maxed and still live; a feed entry claims a window resetting five days
+    later. A later reset is not evidence of a newer window — only of another
+    login. The API's live window wins."""
+    now = 1_000_000.0
+    api = [m.Limit("weekly_all", "Week · all models", 100.0, dt(now + 86_400), is_active=True)]
+    out = m.merge_limits(api, {"weekly_all": (12.0, now + 6 * 86_400)}, now_ts=now)
+    wk = next(l for l in out if l.kind == "weekly_all")
+    assert wk.percent == 100.0 and wk.resets_at == dt(now + 86_400)
+    # once the API's own window has expired, the successor is real: adopt it
+    api = [m.Limit("weekly_all", "Week · all models", 100.0, dt(now - 60), is_active=True)]
+    out = m.merge_limits(api, {"weekly_all": (12.0, now + 6 * 86_400)}, now_ts=now)
+    wk = next(l for l in out if l.kind == "weekly_all")
+    assert wk.percent == 12.0 and wk.resets_at == dt(now + 6 * 86_400)
+
+
+def test_window_is_current():
+    now = 1_000_000.0
+    assert m.window_is_current(now + 100, None, now)          # no API view yet
+    assert m.window_is_current(now + 100, 0.0, now)           # ...nor a usable one
+    assert m.window_is_current(now + 3600, now + 3660, now)   # same instance, within tolerance
+    assert m.window_is_current(now + 3600, now - 10, now)     # successor of an expired window
+    assert not m.window_is_current(now + 3600, now + 600, now)   # API window still live
+    assert not m.window_is_current(now - 3600, now + 600, now)   # an older window entirely
+    # a window about to reset is still live: no slack that would let a foreign
+    # (further-future) window take it over in its last seconds
+    assert not m.window_is_current(now + 5 * 86400, now + 30, now)
+
+
+def test_weekly_reset_of():
+    assert m.weekly_reset_of([]) is None
+    assert m.weekly_reset_of([m.Limit("weekly_all", "w", 5.0, None)]) is None
+    assert m.weekly_reset_of([m.Limit("session", "s", 5.0, dt(1_000_000)),
+                              m.Limit("seven_day", "w", 5.0, dt(2_000_000))]) == 2_000_000.0
 
 
 def test_recompute_events_and_history():
@@ -1034,14 +1129,14 @@ def test_parse_limits_garbage_percent():
 
 def test_read_feed_wrong_typed_leaves(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "FEED_DIR", tmp_path)
-    write_feed_file(tmp_path, "bad1", {"five_hour": {"used_percentage": "bogus", "resets_at": 2_000_000}})
+    write_feed_file(tmp_path, "bad1", {"five_hour": {"used_percentage": "bogus", "resets_at": SOON}})
     write_feed_file(tmp_path, "bad2", {"five_hour": ["not", "a", "dict"]})
-    write_feed_file(tmp_path, "bad3", {"five_hour": {"used_percentage": float("nan"), "resets_at": 2_000_000}})
-    write_feed_file(tmp_path, "good", {"five_hour": {"used_percentage": 21, "resets_at": 2_000_000}})
+    write_feed_file(tmp_path, "bad3", {"five_hour": {"used_percentage": float("nan"), "resets_at": SOON}})
+    write_feed_file(tmp_path, "good", {"five_hour": {"used_percentage": 21, "resets_at": SOON}})
     result = m.read_feed()
     assert result is not None
     feed, _ = result
-    assert feed["session"] == (21.0, 2_000_000.0)  # bad leaves skipped, good survives
+    assert feed["session"] == (21.0, SOON)  # bad leaves skipped, good survives
 
 
 def test_merge_limits_nonfinite_reset_epoch_skipped():
@@ -1049,12 +1144,42 @@ def test_merge_limits_nonfinite_reset_epoch_skipped():
     assert out == []  # unrepresentable timestamp ignored, no OverflowError
 
 
+def test_feed_loop_ignores_the_feed_without_an_api_anchor(monkeypatch):
+    """Right after a login switch api_limits is empty, and every open session is
+    still writing the OLD account's windows under the NEW account's uuid. With no
+    anchor to check them against, the feed must not reach the panel at all."""
+    seen = {"called": False}
+
+    def spy(live_uuid="", weekly_reset=None):
+        seen["called"] = True
+        return ({"weekly_all": (12.0, time.time() + 6 * 86400)}, time.time())
+
+    def run_one_iteration(state):
+        stop = threading.Event()
+        stop.wait = lambda t=None: stop.set() or True  # stop after the first body
+        m.feed_loop(state, stop)
+
+    monkeypatch.setattr(m, "read_feed", spy)
+    monkeypatch.setattr(m.accounts, "active_account_uuid", lambda: "uuid-a")
+    state = m.State()
+
+    run_one_iteration(state)
+    assert not seen["called"] and state.feed is None and state.limits == []
+
+    # once a poll of the live login lands, the feed is anchored and flows again
+    state.api_limits = [m.Limit("weekly_all", "Week · all models", 9.0, dt(time.time() + 6 * 86400))]
+    run_one_iteration(state)
+    assert seen["called"] and state.feed is not None
+    assert next(l for l in state.limits if l.kind == "weekly_all").percent == 12.0
+
+
 def test_feed_loop_survives_read_feed_exception(monkeypatch):
-    def boom():
+    def boom(*_a, **_k):
         raise RuntimeError("corrupt feed")
 
     monkeypatch.setattr(m, "read_feed", boom)
     state = m.State()
+    state.api_limits = [m.Limit("session", "Session · 5h window", 5.0, dt(2_000_000))]  # anchored: read_feed runs
     stop = threading.Event()
     calls = {"n": 0}
     orig_wait = stop.wait

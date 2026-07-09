@@ -29,8 +29,12 @@ if command -v jq > /dev/null 2>&1; then
     FEED_DIR="$HOME/.claude/usage-feed"
     mkdir -p "$FEED_DIR" 2>/dev/null
     TMP="$FEED_DIR/.$SID.$$.tmp"
-    if printf '%s' "$PAYLOAD" | jq -c \
-        '{captured_at: now, session_id: .session_id, rate_limits: .rate_limits}' \
+    # Stamp the login these numbers belong to. Sessions started under different
+    # accounts each report their own windows; without this the monitor merges
+    # them and shows one account's usage under another's name.
+    ACCT=$(jq -r '.oauthAccount.accountUuid // empty' "$HOME/.claude.json" 2>/dev/null)
+    if printf '%s' "$PAYLOAD" | jq -c --arg acct "$ACCT" \
+        '{captured_at: now, account_uuid: $acct, session_id: .session_id, rate_limits: .rate_limits}' \
         > "$TMP" 2>/dev/null; then
       mv -f "$TMP" "$FEED_DIR/$SID.json" 2>/dev/null
     fi
