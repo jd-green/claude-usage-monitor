@@ -86,8 +86,16 @@ RESET_DROP = 20                # a drop this large (in points) counts as a windo
 # Passive feed: statusline-dispatch snapshots the rate_limits that Claude Code
 # pipes to every statusline refresh, one file per session. While any session
 # is running, the monitor reads these instead of hammering the API.
+#
+# Two things the feed is NOT: (a) fresh — a session re-renders its statusline
+# with whatever rate_limits it last learned, so captured_at is when the file
+# was written, not when the numbers were observed; (b) single-login — sessions
+# started under different logins each report their own account's windows.
+# Hence: entries are filtered to the live login, dead windows are dropped, and
+# the API stays the authority on which window instance we are in.
 FEED_DIR = Path.home() / ".claude" / "usage-feed"
 FEED_MAX_AGE = 60              # ignore session files older than this
+FEED_WINDOW_TOL = 120          # resets_at within this many seconds = same window instance
 FEED_POLL = 5                  # how often the feed thread re-reads the dir
 API_RELAXED_INTERVAL = 300     # API poll cadence while the feed is fresh
 FEED_KINDS = {"five_hour": "session", "seven_day": "weekly_all"}
@@ -427,13 +435,54 @@ class State:
 # ------------------------------------------------------------------ feed/merge
 
 
-def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
+def window_is_current(reset_epoch: float, api_reset: float | None, now_ts: float) -> bool:
+    """Is this feed window the instance the API is (or should now be) tracking?
+
+    The API is polled per-login every few minutes, so its window is the truth.
+    A feed window that isn't the API's is only believable as its successor —
+    and only once the API's own window has actually expired. Anything else is
+    another login's window, or another era's.
+    """
+    if api_reset is None or api_reset <= 0:
+        return True  # no API view of this window yet; the feed is all we have
+    if abs(reset_epoch - api_reset) <= FEED_WINDOW_TOL:
+        return True
+    # Successor only once the API's window has *actually* expired. Extending any
+    # slack here would, for those seconds, hand the window to whichever login
+    # resets furthest in the future — the exact substitution this guards against.
+    return reset_epoch > api_reset and api_reset <= now_ts
+
+
+def weekly_reset_of(limits: list[Limit]) -> float | None:
+    """The all-models weekly reset epoch from an API snapshot, if known."""
+    lim = next((l for l in limits if l.kind in ("weekly_all", "seven_day") and l.resets_at), None)
+    return lim.resets_at.timestamp() if lim else None
+
+
+def read_feed(live_uuid: str = "",
+              weekly_reset: float | None = None) -> tuple[dict[str, tuple[float, float]], float] | None:
     """Merge fresh per-session feed files into per-window (pct, resets_epoch).
 
-    Sessions can pipe stale numbers (they report what they last learned), so:
-    take the newest resets_at as the current window instance, then the max
-    percent among sessions reporting that instance — usage is monotonic
-    within a window, so max = freshest.
+    Every session writes the rate_limits it last saw, so a file being written
+    right now can still carry numbers from days ago — and, once more than one
+    login exists, from a *different account* whose windows reset on different
+    days. Three filters keep those out:
+
+      - account: only sessions stamped with the live login count. An unstamped
+        file (pre-upgrade dispatcher) is untrusted once we know the live login.
+      - identity: the weekly reset is a fixed, per-account anchor (one login
+        resets Friday 8pm, another Wednesday midnight). An entry whose weekly
+        anchor isn't the live login's was captured under a different account —
+        which is what a session that predates a `/login` still reports, no
+        matter whose uuid the dispatcher stamped on it. Drop the whole entry:
+        its five-hour window is no more ours than its weekly one.
+      - liveness: a window whose resets_at has passed is over; whatever percent
+        it carries describes a window that no longer exists.
+
+    What survives is same-login, same-era. Then: newest resets_at is the
+    current window instance, and the max percent among sessions reporting that
+    instance wins — usage is monotonic within a window, so max = freshest, and
+    a session sitting on an old percent can only under-report, never invent.
     """
     try:
         files = list(FEED_DIR.glob("*.json"))
@@ -450,6 +499,10 @@ def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
             data = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            continue
+        if live_uuid and data.get("account_uuid") != live_uuid:
+            continue  # another login's session — its windows are not ours
         captured_at = to_float(data.get("captured_at"))
         observed_at = mtime
         if captured_at is not None:
@@ -457,9 +510,15 @@ def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
                 continue
             observed_at = captured_at
         rl = data.get("rate_limits")
-        if isinstance(rl, dict):
-            entries.append(rl)
-            as_of = max(as_of, observed_at)
+        if not isinstance(rl, dict):
+            continue
+        if weekly_reset is not None:
+            week = rl.get("seven_day")
+            wk_reset = to_float(week.get("resets_at")) if isinstance(week, dict) else None
+            if wk_reset is not None and not window_is_current(wk_reset, weekly_reset, now_ts):
+                continue  # captured under a different login's weekly anchor
+        entries.append(rl)
+        as_of = max(as_of, observed_at)
     if not entries:
         return None
     merged: dict[str, tuple[float, float]] = {}
@@ -471,8 +530,8 @@ def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
                 continue
             pct = to_float(w.get("used_percentage"))
             rst = to_float(w.get("resets_at"))
-            if pct is None or rst is None:
-                continue
+            if pct is None or rst is None or rst <= now_ts:
+                continue  # no numbers, or a window that has already reset
             cands.append((rst, pct))
         if not cands:
             continue
@@ -481,8 +540,18 @@ def read_feed() -> tuple[dict[str, tuple[float, float]], float] | None:
     return (merged, as_of) if merged else None
 
 
-def merge_limits(api_limits: list[Limit], feed: dict[str, tuple[float, float]] | None) -> list[Limit]:
-    """Overlay the passive feed onto the last API snapshot, monotonic per window."""
+def merge_limits(api_limits: list[Limit], feed: dict[str, tuple[float, float]] | None,
+                 now_ts: float | None = None) -> list[Limit]:
+    """Overlay the passive feed onto the last API snapshot, monotonic per window.
+
+    The API is the authority on *which* window instance is current; the feed
+    only supplies a fresher percent inside it. A feed window the API doesn't
+    recognise is adopted only when the API's own window has expired — i.e. a
+    real reset the next poll hasn't caught up with yet. Otherwise it belongs to
+    some other login or era, and silently replacing a live window with it is
+    how a maxed-out week comes to read 12%.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
     limits = [replace(l) for l in api_limits]
     if not feed:
         return limits
@@ -499,12 +568,13 @@ def merge_limits(api_limits: list[Limit], feed: dict[str, tuple[float, float]] |
             limits.append(Limit(kind=kind, label=KIND_LABELS.get(kind, prettify_key(kind)),
                                 percent=pct, resets_at=resets_at))
             continue
-        api_reset = lim.resets_at.timestamp() if lim.resets_at else 0.0
-        if reset_epoch > api_reset + 120:      # feed sees a newer window instance
-            lim.percent, lim.resets_at = pct, resets_at
-        elif reset_epoch > api_reset - 120:    # same window: usage only climbs
-            lim.percent = pct if lim.percent is None else max(lim.percent, pct)
-        # else: feed entry is for an already-ended window; keep API data
+        api_reset = lim.resets_at.timestamp() if lim.resets_at else None
+        if not window_is_current(reset_epoch, api_reset, now_ts):
+            continue  # a window the API — polled per-login, minutes ago — doesn't know
+        if api_reset is not None and abs(reset_epoch - api_reset) <= FEED_WINDOW_TOL:
+            lim.percent = pct if lim.percent is None else max(lim.percent, pct)  # same window: usage only climbs
+        else:
+            lim.percent, lim.resets_at = pct, resets_at  # the successor window, seen before the next poll
     limits.sort(key=lambda l: KIND_ORDER.get(l.kind, 99))
     return limits
 
@@ -513,7 +583,7 @@ def recompute(state: State) -> list[str]:
     """Rebuild the merged view + history; return notification-worthy events."""
     now_ts = time.time()
     with state.lock:
-        merged = merge_limits(state.api_limits, state.feed)
+        merged = merge_limits(state.api_limits, state.feed, now_ts)
         events = detect_events(state.merged_prev, merged) if state.merged_prev is not None else []
         state.merged_prev = merged
         state.limits = merged
@@ -673,7 +743,20 @@ def feed_loop(state: State, stop: threading.Event, notify: bool = False) -> None
     last_save = time.time()
     while not stop.is_set():
         try:
-            result = read_feed()
+            # The feed is an overlay on an API snapshot, never a substitute for
+            # one: without the live login's own window anchors there is no way
+            # to tell whose numbers a session file carries. A login switch
+            # clears api_limits, and every open session keeps writing the OLD
+            # account's windows stamped with the NEW account's uuid — so until
+            # the next poll lands (seconds; poll_wake kicks it) show nothing
+            # rather than the previous login's usage.
+            with state.lock:
+                live_uuid = state.live_uuid
+                anchored = bool(state.api_limits)
+                weekly_reset = weekly_reset_of(state.api_limits)
+            if not live_uuid:
+                live_uuid = accounts.active_account_uuid()
+            result = read_feed(live_uuid, weekly_reset) if anchored else None
             with state.lock:
                 state.feed, state.feed_as_of = result if result else (None, None)
             for msg in recompute(state):

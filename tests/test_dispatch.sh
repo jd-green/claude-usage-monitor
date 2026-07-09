@@ -34,6 +34,15 @@ printf '%s' "$OUT" | grep -q "HOME=$TMP\$" || fail "full: must use real HOME"
 [ -f "$TMP/.claude/usage-feed/test-sess.json" ] || fail "full: feed not written"
 jq -e '.rate_limits.five_hour.used_percentage == 21 and .captured_at > 0' \
   "$TMP/.claude/usage-feed/test-sess.json" > /dev/null || fail "full: feed content wrong"
+# no ~/.claude.json to read: stamp an empty login rather than guessing one
+jq -e '.account_uuid == ""' "$TMP/.claude/usage-feed/test-sess.json" > /dev/null \
+  || fail "full: account_uuid must be empty when the login is unknown"
+
+# --- feed carries the live login, so the monitor can scope to it -------------
+echo '{"oauthAccount":{"accountUuid":"uuid-abc"}}' > "$TMP/.claude.json"
+printf '%s' "$PAYLOAD" | "$DIR/statusline-dispatch" > /dev/null
+jq -e '.account_uuid == "uuid-abc"' "$TMP/.claude/usage-feed/test-sess.json" > /dev/null \
+  || fail "full: feed must stamp the active account uuid"
 
 # --- lite mode: exactly once (double-run regression), shadow HOME, no network widgets
 touch "$TMP/.claude/statusline.lite"

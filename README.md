@@ -293,6 +293,17 @@ poll relaxes to every 5 minutes while the feed is fresh. When the API does
 per-session polling entirely, which makes the monitor's own refreshes far more
 reliable.
 
+The feed is a cache, not a source of truth. A session re-renders its statusline
+with whatever `rate_limits` it last learned — a terminal left open for days
+still writes a file every few seconds, and after a `/login` it keeps reporting
+the *previous* account's windows. So the API stays the authority on which
+window instance is current: feed entries are scoped to the live login, entries
+whose weekly reset doesn't match that login's anchor are discarded whole,
+windows that have already reset are dropped, and a percent is only ever
+overlaid on the window the API already knows about (or its successor, once the
+API's own window has expired). Within a window the feed can only revise usage
+upward, which is safe — usage is monotonic.
+
 ## Testing
 
 ```sh
